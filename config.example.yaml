@@ -1,0 +1,59 @@
+# Public-safe template. Copy to ignored config.yaml and fill from authorized inputs.
+device:
+  reference: null
+electrical:
+  vin_range_v: null
+  vout_range_v: null
+  iout_variants_a: null
+  high_side_rds_on_mohm: null
+  low_side_rds_on_mohm: null
+  switching_frequencies_khz: null
+  operating_point: {vin_v: null, vout_v: null, iout_a: null, switching_frequency_khz: null}
+geometry:
+  units: mm
+  module_footprint_mm: null
+  target_total_height_mm: null
+  ic_height_mm: null
+  ic_footprint_mm: null
+  inductor_footprint_mm: null
+  proposed_inductor_height_mm: null
+  arrangement: null
+  stack_status: unresolved
+  ic_z_mm: null
+  inductor_z_mm: null
+pcb:
+  layout: null
+  vout_region: null
+  power_regions: null
+  multiple_power_vias: null
+  connections: null
+  copper_dimensions_mm: null
+  layer_stackup: null
+  via_geometry_mm: null
+materials:
+  thermal_conductivity_w_m_k: null
+  density_kg_m3: null
+  specific_heat_j_kg_k: null
+  electrical_conductivity_s_m: null
+  relative_permittivity: null
+  magnetic_permeability_h_m: null
+  magnetic_loss_model: null
+losses:
+  conduction_model: null
+  switching_parameters: null
+  inductor_copper_parameters: null
+  inductor_core_parameters: null
+  spatial_heat_sources: null
+cooling:
+  method: null
+  coolant: null
+  coolant_temperature_k: null
+  heat_transfer_coefficient_w_m2_k: null
+  flow_rate_m3_s: null
+  contact_resistance_m2_k_w: null
+simulation:
+  mesh: null
+  boundary_conditions: null
+  initial_temperature_k: null
+  time_step_s: null
+  duration_s: null
