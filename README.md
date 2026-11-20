@@ -11,6 +11,21 @@ CMake 3.24+, a CUDA-compatible C++ compiler, Python 3.11+, and `uv`.
 PyVista interactive viewing needs a graphical display; offscreen rendering needs
 a working VTK EGL/OSMesa/display backend. Gmsh may require system OpenGL libraries.
 
+For interactive matplotlib windows, install the optional Qt backend:
+
+```sh
+uv sync --extra gui
+uv run --extra gui python/geometry.py
+uv run --extra gui python/visualize.py
+```
+
+Both commands open the module model; `visualize.py` uses PyVista instead when
+given a VTK result file. A working desktop display is required. The viewer tries
+Qt when installed, then Tk otherwise. If no interactive backend can initialize,
+it saves `output/module.png` and reports its path. Use `--screenshot output/module.png`
+for intentional headless rendering, or `--backend QtAgg` to require Qt and report
+initialization errors. The `--extra gui` flag keeps Qt installed during `uv run`.
+
 From the repository root:
 
 ```sh

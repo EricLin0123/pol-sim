@@ -58,12 +58,38 @@ def export_model(model, directory):
     (directory/'module.geom').write_text('\n'.join(lines)+'\n')
 
 
-def plot_model(model, screenshot=None):
+def plot_model(model, screenshot=None, backend=None):
+    import importlib.util
+    import matplotlib
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyBboxPatch
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection, pathpatch_2d_to_3d
 
-    fig = plt.figure(figsize=(12,6))
+    try:
+        if screenshot:
+            plt.switch_backend('Agg')
+        elif backend:
+            plt.switch_backend(backend)
+        elif matplotlib.get_backend().lower() == 'agg':
+            if importlib.util.find_spec('PySide6'):
+                plt.switch_backend('QtAgg')
+            else:
+                import _tkinter
+                if not getattr(_tkinter, '__file__', None):
+                    raise RuntimeError('This uv Python has incompatible Tk support. Install GUI support: uv sync --extra gui')
+                plt.switch_backend('TkAgg')
+        fig = plt.figure(figsize=(12,6))
+    except Exception as error:
+        # Only backend/window initialization is guarded, not model rendering.
+        if backend:
+            raise RuntimeError(f'Cannot open matplotlib backend {backend}: {error}') from error
+        plt.switch_backend('Agg')
+        screenshot = screenshot or ROOT/'output'/'module.png'
+        print(f'Interactive display unavailable: {error}')
+        fig = plt.figure(figsize=(12,6))
+    if fig.canvas.manager is None or fig.canvas.required_interactive_framework is None:
+        if matplotlib.get_backend().lower() == 'agg':
+            screenshot = screenshot or ROOT/'output'/'module.png'
     ax = fig.add_subplot(121, projection='3d')
     for b, color in zip(model['bodies'], ('royalblue','orange')):
         x0,y0,z0 = b['min_mm']
@@ -99,6 +125,7 @@ def plot_model(model, screenshot=None):
         screenshot.parent.mkdir(parents=True,exist_ok=True)
         fig.savefig(screenshot,dpi=180)
         plt.close(fig)
+        print(f'Saved module preview: {screenshot.resolve()}')
     else:
         plt.show()
 
@@ -110,6 +137,7 @@ def main():
     parser.add_argument('--output-dir',type=Path,default=DATA)
     parser.add_argument('--model',type=Path,help='View saved module.json without regenerating')
     parser.add_argument('--screenshot',type=Path)
+    parser.add_argument('--backend',help='Matplotlib backend, e.g. TkAgg or QtAgg')
     parser.add_argument('--no-view',action='store_true',help='Export only')
     args = parser.parse_args()
     if args.model:
@@ -119,7 +147,7 @@ def main():
         export_model(model,args.output_dir)
         print(f'Shared model written to {args.output_dir}')
     if not args.no_view:
-        plot_model(model,args.screenshot)
+        plot_model(model,args.screenshot,args.backend)
 
 
 if __name__ == '__main__':

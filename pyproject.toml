@@ -11,3 +11,6 @@ dependencies = [
     "gmsh",
     "pyyaml",
 ]
+
+[project.optional-dependencies]
+gui = ["pyside6"]
