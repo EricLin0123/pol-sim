@@ -4,12 +4,13 @@ import json
 import math
 from pathlib import Path
 import yaml
+from inductor import add_inductor_parts, demo_parameters
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / 'data'
 
 
-def build_model(config, footprint):
+def build_model(config, footprint, demo_winding=False):
     g = config['geometry']
     if g['units'] != 'mm' or footprint['units'] != 'mm':
         raise ValueError('Expected millimeter geometry')
@@ -34,18 +35,35 @@ def build_model(config, footprint):
     if not all(math.isclose(a,b) for a,b in zip(g['ic_footprint_mm'],
             [footprint['package']['width_mm'], footprint['package']['height_mm']])):
         raise ValueError('Footprint and package dimensions differ')
-    return dict(schema_version=1, units='mm', origin='package bottom center',
+    model = dict(schema_version=2, units='mm', origin='package bottom center',
                 assumptions=['Centered envelopes; no interface gap or thickness',
                              'Pads are surfaces at package bottom; thickness unknown',
                              'Original footprint x/y; orientation unverified, no mirroring'],
                 bodies=bodies, pad_z_mm=ic['min_mm'][2], footprint=footprint)
+    for body in bodies:
+        body['role'] = 'envelope'
+    params = config.get('inductor', {}).get('winding_geometry')
+    if demo_winding:
+        params = demo_parameters([b-a for a,b in zip(ind['min_mm'],ind['max_mm'])])
+    if params and (demo_winding or params.get('topology')):
+        add_inductor_parts(model, params, illustrative=demo_winding)
+    return model
 
 
 def export_model(model, directory):
-    lines = ['POL_SIM_GEOMETRY_V1 mm']
+    lines = ['POL_SIM_GEOMETRY_V2 mm']
     for b in model['bodies']:
-        lines.append('BOX ' + json.dumps(b['name']) + ' ' +
+        lines.append('BOX ' + ' '.join(json.dumps(v) for v in
+                     (b['name'], b.get('material') or 'unassigned', b.get('role', 'envelope'))) + ' ' +
                      ' '.join(map(str, b['min_mm']+b['max_mm'])))
+    for c in model.get('capsules', []):
+        lines.append('CAPSULE ' + json.dumps(c['name']) + ' ' + json.dumps(c['material']) + ' ' +
+                     ' '.join(map(str, c['a_mm']+c['b_mm']+[c['radius_mm']])))
+    if model.get('composite_region'):
+        region = model['composite_region']
+        lines.append('COMPOSITE ' + json.dumps(region['envelope']) + ' ' +
+                     str(region['wire_clearance_mm']))
+    lines.append('ILLUSTRATIVE ' + str(int(model.get('inductor_detail', {}).get('illustrative', False))))
     for p in model['footprint']['pads']:
         x, y, w, h = p['rect_mm']
         r = p['corner_radius_mm']
@@ -91,15 +109,35 @@ def plot_model(model, screenshot=None, backend=None):
         if matplotlib.get_backend().lower() == 'agg':
             screenshot = screenshot or ROOT/'output'/'module.png'
     ax = fig.add_subplot(121, projection='3d')
-    for b, color in zip(model['bodies'], ('royalblue','orange')):
+    detailed = bool(model.get('capsules'))
+    for b in model['bodies']:
+        color = ('silver' if b.get('material') == 'terminal_metal' else
+                 'royalblue' if b['name'] == 'ic_package' else 'dimgray' if detailed else 'orange')
         x0,y0,z0 = b['min_mm']
         x1,y1,z1 = b['max_mm']
         vertices = [(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),
                     (x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)]
         faces = [[vertices[i] for i in face] for face in
                  ((0,1,2,3),(4,5,6,7),(0,1,5,4),(1,2,6,5),(2,3,7,6),(3,0,4,7))]
-        ax.add_collection3d(Poly3DCollection(faces, facecolor=color, edgecolor='black', alpha=0.25))
-        ax.text(0,0,(z0+z1)/2,b['name'],ha='center')
+        alpha = 0.10 if b['name'] == 'inductor' and detailed else 0.65 if b.get('role') == 'solid' else 0.20
+        ax.add_collection3d(Poly3DCollection(faces, facecolor=color, edgecolor='black', alpha=alpha))
+    if detailed:
+        import numpy as np
+        faces = []
+        # Draw actual-radius tubes, rather than screen-space thick lines.
+        for c in model['capsules']:
+            a, b = np.array(c['a_mm']), np.array(c['b_mm'])
+            direction = b-a
+            direction /= np.linalg.norm(direction)
+            ref = np.array([0.,0.,1.]) if abs(direction[2]) < 0.9 else np.array([1.,0.,0.])
+            u = np.cross(direction,ref); u /= np.linalg.norm(u)
+            v = np.cross(direction,u)
+            ring = np.array([c['radius_mm']*(u*np.cos(t)+v*np.sin(t)) for t in np.linspace(0,2*np.pi,12,endpoint=False)])
+            for i in range(12):
+                j = (i+1)%12
+                faces.append([a+ring[i],a+ring[j],b+ring[j],b+ring[i]])
+        ax.add_collection3d(Poly3DCollection(faces,facecolor='#b87333',edgecolor='none'))
+        ax.text2D(0.02,0.95,'Copper winding / silver terminals\nTransparent composite boundary',transform=ax.transAxes)
     bottom = fig.add_subplot(122)
     for p in model['footprint']['pads']:
         x,y,w,h = p['rect_mm']
@@ -119,7 +157,8 @@ def plot_model(model, screenshot=None, backend=None):
     ax.set_box_aspect([b-a for a,b in zip(lo,hi)])
     bottom.set(xlim=(lo[0],hi[0]),ylim=(lo[1],hi[1]),aspect='equal',
                xlabel='x (mm)',ylabel='y (mm)',title='Pad plane (original x/y; no mirroring)')
-    fig.suptitle('Envelope model only — inferred/unconfirmed pin assignments retained')
+    label = 'ILLUSTRATIVE winding — not reference-validated' if model.get('inductor_detail',{}).get('illustrative') else 'Unverified parametric geometry'
+    fig.suptitle(label + ' — pin assignments retained as supplied')
     fig.subplots_adjust(left=0.04, right=0.96, bottom=0.12, top=0.85, wspace=0.25)
     if screenshot:
         screenshot.parent.mkdir(parents=True,exist_ok=True)
@@ -134,18 +173,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=ROOT/'config.yaml')
     parser.add_argument('--footprint',type=Path,default=DATA/'footprint.json')
-    parser.add_argument('--output-dir',type=Path,default=DATA)
+    parser.add_argument('--output-dir',type=Path)
+    parser.add_argument('--demo-winding',action='store_true',help='Use explicitly illustrative internals; export to output/inductor-demo by default')
     parser.add_argument('--model',type=Path,help='View saved module.json without regenerating')
     parser.add_argument('--screenshot',type=Path)
     parser.add_argument('--backend',help='Matplotlib backend, e.g. TkAgg or QtAgg')
     parser.add_argument('--no-view',action='store_true',help='Export only')
     args = parser.parse_args()
+    if args.model and args.demo_winding:
+        parser.error('--model and --demo-winding cannot be combined')
+    directory = args.output_dir or (ROOT/'output'/'inductor-demo' if args.demo_winding else DATA)
     if args.model:
         model = json.loads(args.model.read_text())
     else:
-        model = build_model(yaml.safe_load(args.config.read_text()),json.loads(args.footprint.read_text()))
-        export_model(model,args.output_dir)
-        print(f'Shared model written to {args.output_dir}')
+        model = build_model(yaml.safe_load(args.config.read_text()),json.loads(args.footprint.read_text()),args.demo_winding)
+        export_model(model,directory)
+        print(f'Shared model written to {directory}')
     if not args.no_view:
         plot_model(model,args.screenshot,args.backend)
 

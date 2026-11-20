@@ -19,6 +19,7 @@ __pycache__/
 /confidential/
 /private/
 /inputs/
+/images/
 /data/*
 !/data/.gitkeep
 /footprint.json

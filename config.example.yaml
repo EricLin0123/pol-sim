@@ -9,6 +9,21 @@ electrical:
   low_side_rds_on_mohm: null
   switching_frequencies_khz: null
   operating_point: {vin_v: null, vout_v: null, iout_a: null, switching_frequency_khz: null}
+inductor:
+  type: null
+  nominal_inductance_h: null
+  winding_geometry:
+    # Unknown device internals: set values only from measurements or an explicit assumption.
+    topology: null # Supported: round_wire_helix; not inferred from 220 nH.
+    turns: null
+    wire_diameter_mm: null
+    centerline_radius_mm: null
+    winding_height_mm: null
+    winding_bottom_mm: null # Relative to inductor bottom.
+    insulation_clearance_mm: null
+    terminal_size_mm: null # x, y, z; terminal metal remains unspecified.
+    terminal_radial_center_mm: null
+    segments_per_turn: null # Tessellation only; integer 12..1024.
 geometry:
   units: mm
   module_footprint_mm: null

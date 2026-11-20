@@ -85,21 +85,61 @@ CUDA C++ tasks include `src/module_geometry.hpp` and call
 `load_module_geometry(path)`; both scaffold executables already support it.
 The reader loads host-side arrays for later GPU upload; it does not solve physics.
 
-`module.json` contains envelopes plus the complete footprint metadata.
-`module.geom` is the dependency-free C++ representation, regenerated alongside it:
-first line `POL_SIM_GEOMETRY_V1 mm`, followed by `BOX "name" xmin ymin zmin xmax
-ymax zmax` and `PAD "name" "net" "status" x y width height corner_radius z` records.
+`module.json` contains geometry plus the complete footprint metadata.
+`module.geom` is the dependency-free C++ representation, regenerated alongside it.
+The V2 format begins with `POL_SIM_GEOMETRY_V2 mm` and uses these records:
+
+```text
+BOX "name" "material" "role" xmin ymin zmin xmax ymax zmax
+CAPSULE "name" "material" ax ay az bx by bz radius
+COMPOSITE "envelope_box_name" wire_clearance
+ILLUSTRATIVE 0_or_1
+PAD "name" "net" "status" x y width height corner_radius z
+```
+
+The C++ reader also accepts the earlier V1 envelope format.
 Lengths are mm; future SI solvers must convert at their input boundary. The pad
 radius is retained as supplied; the preview clamps it to half the shorter side.
 Regenerate both files after editing config or footprint; do not edit exports.
+
+Parametric choke internals are implemented in `python/inductor.py`. Configure
+`inductor.winding_geometry` in the local YAML for a round-wire helix with radial
+leads and two rectangular terminals. Parameters control turns, wire diameter,
+radius, winding height and bottom offset, insulation clearance, terminal size
+and radial location, and tessellation. Winding bottom is relative to the
+inductor bottom. An integer turn count places terminals at the same angle and
+is rejected if they overlap; this topology does not represent every choke.
+The material of the terminals, insulation properties, and composite properties
+remain unspecified. Inductance is not computed or calibrated by this generator.
+
+Unknown device internals remain null. To inspect explicitly illustrative
+parameters without changing the device configuration or canonical exports:
+
+```sh
+uv run --extra gui python/geometry.py --demo-winding
+uv run python/geometry.py --demo-winding --screenshot output/inductor-demo.png
+uv run --extra gui python/visualize.py --model output/inductor-demo/module.json
+./build/thermal --model output/inductor-demo/module.geom
+./build/em --model output/inductor-demo/module.geom
+```
+
+Demo files go to `output/inductor-demo/` and carry an illustrative flag in JSON
+and CUDA input. The viewer shows the composite's transparent outer boundary;
+its interior is defined by constructive geometry in the exports, not a volume
+mesh. Material priority is the copper capsule union, terminal boxes minus
+copper, then composite envelope minus terminals and clearance-expanded capsules.
+The intervening clearance sleeve has no assigned material. Envelope boxes are
+not additional physical solids. These rules prevent material double counting
+when downstream solvers implement region classification. Geometric checks
+cover containment, winding pitch, and terminal overlap, not all manufacturing
+constraints or self-intersections. The demo is not matched to a reference image.
 
 All files under `data/` except `.gitkeep` are ignored because package geometry and
 pin definitions are confidential. Restore authorized local data after cloning.
 The VTK visualization script remains available for future simulation results.
 
-Keep this repository private. No remote is configured or publication performed.
-If hosted later, select private visibility. Confidential source documents belong
-in `confidential/` or `inputs/`; proprietary settings belong in ignored
+This repository publishes only the generic research scaffold. Confidential source
+documents belong in `confidential/` or `inputs/`; proprietary settings belong in ignored
 `config.yaml`, `config.*.yaml`, or `private/`. Generated data belongs in `output/`.
 Ignore rules cannot enforce remote visibility or prevent explicitly forced adds;
 review staged files before committing. Do not commit confidential values into

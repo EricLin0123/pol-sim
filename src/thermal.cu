@@ -10,8 +10,10 @@ int main(int argc, char** argv) {
     if (argc == 3) {
         try {
             const auto model = load_module_geometry(argv[2]);
-            std::cout << "Loaded " << model.boxes.size() << " envelopes and "
-                      << model.pads.size() << " pad surfaces (mm)." << std::endl;
+            std::cout << "Loaded " << model.boxes.size() << " boxes and "
+                      << model.pads.size() << " pad surfaces and " << model.capsules.size()
+                      << " wire capsules (mm)." << std::endl;
+            if (model.illustrative) std::cout << "ILLUSTRATIVE internal geometry; not device-validated.\n";
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';
             return 1;
