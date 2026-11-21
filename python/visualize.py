@@ -191,6 +191,10 @@ def main():
             parser.error(f"File not found: {args.model}")
         plot_model(model,args.screenshot,args.backend)
         return
+    if args.input.name == 'magnetic.vtu':
+        from em_view import view
+        view(args.input, args.screenshot)
+        return
     if not args.input.is_file():
         parser.error(f"File not found: {args.input}")
     import pyvista as pv
