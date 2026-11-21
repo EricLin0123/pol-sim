@@ -10,7 +10,5 @@ dependencies = [
     "pyvista",
     "gmsh",
     "pyyaml",
+    "pyside6",
 ]
-
-[project.optional-dependencies]
-gui = ["pyside6"]

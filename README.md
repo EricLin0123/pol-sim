@@ -11,20 +11,28 @@ CMake 3.24+, a CUDA-compatible C++ compiler, Python 3.11+, and `uv`.
 PyVista interactive viewing needs a graphical display; offscreen rendering needs
 a working VTK EGL/OSMesa/display backend. Gmsh may require system OpenGL libraries.
 
-For interactive matplotlib windows, install the optional Qt backend:
+The Qt backend is included in the default dependencies. To view the full assembly:
 
 ```sh
-uv sync --extra gui
-uv run --extra gui python/geometry.py
-uv run --extra gui python/visualize.py
+uv sync
+uv run python/geometry.py
+uv run python/visualize.py
 ```
 
-Both commands open the module model; `visualize.py` uses PyVista instead when
-given a VTK result file. A working desktop display is required. The viewer tries
+`visualize.py` rebuilds the full assembly from current local inputs on every run.
+It includes illustrative winding details when actual winding dimensions are unset,
+with that assumption labeled in the viewer. No model-selection or demo arguments
+are needed. Sidebar checkboxes independently toggle the package envelope,
+composite boundary, silicon die, winding, leads, terminals, FET annotations, and
+pads/pins across the 3D and plan views. All start visible. Uncheck envelopes or
+pads to inspect interior parts. Viewer exports are stored in
+`output/visualization/`, keeping canonical simulation inputs separate.
+`geometry.py` remains the explicit geometry generator. `visualize.py` uses PyVista
+instead when given a VTK result file. A working desktop display is required. The viewer tries
 Qt when installed, then Tk otherwise. If no interactive backend can initialize,
 it saves `output/module.png` and reports its path. Use `--screenshot output/module.png`
 for intentional headless rendering, or `--backend QtAgg` to require Qt and report
-initialization errors. The `--extra gui` flag keeps Qt installed during `uv run`.
+initialization errors.
 
 From the repository root:
 
@@ -58,13 +66,14 @@ UV_CACHE_DIR=/tmp/pol-sim-uv-cache uv run python python/visualize.py output/resu
 The local geometry configuration now defines a centered IC package and inductor
 stack, with the package bottom at z=0 and no additional interface thickness.
 These are assumed outer envelopes, not internal die, winding, or core geometry.
-Materials and pad thickness remain unspecified. No solver mesh is generated.
+Material properties are kept in local configuration. No solver mesh is generated.
 
 `data/footprint.json` is the shared source for pin geometry and net definitions.
 The generator preserves its original coordinates, provenance, warnings, and
 unconfirmed assignments. `rect_mm` is interpreted as `[x_min, y_min, width, height]`;
 source orientation still needs verification before manufacturing or simulation.
-Pads are zero-thickness surfaces at the package bottom. The viewer shows a
+Pin lands use configurable thickness and bottom z, extruded as rounded copper
+prisms. Original footprint data remains unchanged. The viewer shows a
 rotatable 3D assembly and a labeled pad-plane view, using matplotlib.
 
 ```sh
@@ -95,12 +104,45 @@ CAPSULE "name" "material" ax ay az bx by bz radius
 COMPOSITE "envelope_box_name" wire_clearance
 ILLUSTRATIVE 0_or_1
 PAD "name" "net" "status" x y width height corner_radius z
+PIN_VOLUME "name" "net" "status" "material" x y width height effective_corner_radius zmin zmax
+HEAT_SOURCE "name" "host_box" "surface" "status" depth area_or_unset power_or_unset has_xy xmin ymin xmax ymax
 ```
 
 The C++ reader also accepts the earlier V1 envelope format.
 Lengths are mm; future SI solvers must convert at their input boundary. The pad
 radius is retained as supplied; the preview clamps it to half the shorter side.
 Regenerate both files after editing config or footprint; do not edit exports.
+
+An optional local `die` proposal adds a silicon solid and heat-source annotations
+to both exports. Die/FET x/y coordinates are relative to the IC package origin;
+die bottom z is relative to the package bottom. Heat-source areas and powers are
+retained separately; an unset power is not zero. Control logic stays unplaced
+unless its geometry is supplied. FET annotations remain silicon, not extra solids.
+`heat_source_surface` may be `top`, `bottom`, or null. A null surface preserves the
+specified depth but leaves source z bounds unresolved. When a surface is specified, the viewer draws finite-depth FET subvolumes;
+otherwise it shows labeled projections only. A separate floorplan remains visible. The package remains an
+envelope because its internal leadframe, die attach, and molding fill are unknown.
+In `HEAT_SOURCE` records, `has_xy=0` means the four following coordinates are
+ignored; `surface="unresolved"` forbids inferring source z. CUDA readers retain
+unknown powers/areas as `std::nullopt`, not zero. Geometry status is preserved.
+
+`geometry.pin_thickness_mm` and `pin_bottom_z_mm` control copper pad volumes;
+bottom z is relative to the package bottom. `PIN_VOLUME` records carry rounded
+prism geometry into CUDA C++; legacy `PAD` records describe contact faces only
+and must not be counted as additional solids. Pin corner radii are clamped to
+half the smaller pad dimension, matching the existing footprint preview.
+FET sources occupy their configured depth **within** the silicon die. A mesher
+must fragment silicon into source regions and remaining silicon; adding overlapping
+source solids to an intact die would double-count volume. C++ heat-source
+`bounds_mm` stores the resolved subvolume when its surface and footprint exist.
+
+`module.json` includes `meshing_status`, with overlapping pin bounding-box
+candidates, unplaced heat sources, and remaining geometry omissions. This is
+an input audit, not a guarantee of a watertight mesh. The package is still an
+envelope, and the composite is a difference-region description. A conformal
+Boolean partition, material assignment to every remaining region, and actual
+volume meshing are still required. Preview triangles/tubes are display assets,
+not a closed, stitched simulation mesh.
 
 Parametric choke internals are implemented in `python/inductor.py`. Configure
 `inductor.winding_geometry` in the local YAML for a round-wire helix with radial
@@ -116,9 +158,9 @@ Unknown device internals remain null. To inspect explicitly illustrative
 parameters without changing the device configuration or canonical exports:
 
 ```sh
-uv run --extra gui python/geometry.py --demo-winding
+uv run python/geometry.py --demo-winding
 uv run python/geometry.py --demo-winding --screenshot output/inductor-demo.png
-uv run --extra gui python/visualize.py --model output/inductor-demo/module.json
+uv run python/visualize.py --model output/inductor-demo/module.json
 ./build/thermal --model output/inductor-demo/module.geom
 ./build/em --model output/inductor-demo/module.geom
 ```

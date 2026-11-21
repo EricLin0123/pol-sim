@@ -963,15 +963,11 @@ dependencies = [
     { name = "matplotlib" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pyside6" },
     { name = "pyvista" },
     { name = "pyyaml" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-
-[package.optional-dependencies]
-gui = [
-    { name = "pyside6" },
 ]
 
 [package.metadata]
@@ -979,12 +975,11 @@ requires-dist = [
     { name = "gmsh" },
     { name = "matplotlib" },
     { name = "numpy" },
-    { name = "pyside6", marker = "extra == 'gui'" },
+    { name = "pyside6" },
     { name = "pyvista" },
     { name = "pyyaml" },
     { name = "scipy" },
 ]
-provides-extras = ["gui"]
 
 [[package]]
 name = "pooch"
