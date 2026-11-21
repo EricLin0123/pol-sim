@@ -50,13 +50,13 @@ std::vector<T> read_array(std::ifstream &f, size_t n)
 struct Input
 {
     int n, nt, nf, nr, nnz;
-    std::vector<double> xyz, k, h, eps, pcb;
+    std::vector<double> xyz, k, h, eps, pcb, rho_cp;
     std::vector<int> tet, region, face, tslot, fslot, row, col;
     explicit Input(const fs::path &path)
     {
         std::ifstream f(path, std::ios::binary);
         char magic[8];
-        if (!f.read(magic, 8) || std::string(magic, 8) != "POLTHM01")
+        if (!f.read(magic, 8) || (std::string(magic, 8) != "POLTHM01" && std::string(magic,8) != "POLTHM02"))
             throw std::runtime_error("Invalid thermal input header");
         auto counts = read_array<int>(f, 5);
         n = counts[0];
@@ -78,6 +78,7 @@ struct Input
         fslot = read_array<int>(f, size_t(nf) * 9);
         row = read_array<int>(f, n + 1);
         col = read_array<int>(f, nnz);
+        rho_cp = std::string(magic,8)=="POLTHM02" ? read_array<double>(f,nt) : std::vector<double>(nt,0);
         for (int i : tet)
             if (i < 0 || i >= n)
                 throw std::runtime_error("Invalid tetrahedron node");
@@ -374,6 +375,22 @@ __global__ void absolute_temperature(int n, const double *theta, double ambient,
     if (i < n)
         t[i] = theta[i] + ambient;
 }
+__global__ void lumped_capacity(int nt,const int* tet,const double* volume,const double* rho_cp,double* capacity) {
+    int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=nt)return;
+    for(int i=0;i<4;++i)atomicAdd(capacity+tet[4*e+i],rho_cp[e]*volume[e]/4);
+}
+__global__ void initial_field(int n,double rise,double* theta) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)theta[i]=rise;
+}
+__global__ void time_matrix(int n,const int* row,const int* col,const double* capacity,const double* old,double dt,double* a,double* rhs) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n)return;
+    double coefficient=capacity[i]/dt;
+    for(int j=row[i];j<row[i+1];++j)if(col[j]==i)a[j]+=coefficient;
+    rhs[i]+=coefficient*old[i];
+}
+__global__ void stored_heat_rate(int n,const double* capacity,const double* theta,const double* old,double dt,double* result) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)atomicAdd(result,capacity[i]*(theta[i]-old[i])/dt);
+}
 int blocks(int n) { return (n + 255) / 256; }
 struct PCGResult
 {
@@ -504,14 +521,30 @@ void self_test()
     double radiation = .5 * 5.670374419e-8 * area * (std::pow(320., 4) - std::pow(300., 4));
     if (std::abs(out[0] - 2 * area * 20) > 1e-10 || std::abs(out[1] - radiation) > 1e-10 || std::abs(out[2] - 3 * area * 20) > 1e-10)
         throw std::runtime_error("Self-test: boundary energy quadrature failed");
+    // Adiabatic uniform heating: C_total=1 J/K, P=2 W, dt=.5 s -> +1 K.
+    Device<double> rc(1),capacity(4),old(4),stored(1);
+    rc.upload({6});capacity.zero();
+    lumped_capacity<<<1,256>>>(1,tet.p,volume.p,rc.p,capacity.p);
+    for(double c:capacity.download())if(std::abs(c-.25)>1e-13)throw std::runtime_error("Self-test: lumped capacity failed");
+    a.zero();rv.zero();stiffness<<<1,256>>>(1,tet.p,region.p,xyz.p,k.p,slots.p,a.p,volume.p,rv.p,invalid.p);
+    rhs.zero();source<<<1,256>>>(1,tet.p,region.p,volume.p,rv.p,power.p,rhs.p);
+    old.upload({20,20,20,20});x.upload({20,20,20,20});
+    time_matrix<<<1,256>>>(4,row.p,col.p,capacity.p,old.p,.5,a.p,rhs.p);
+    auto step=cg.solve(row.p,col.p,a.p,rhs.p,x.p,50,1e-12,1e-14);
+    for(double t:x.download())if(!step.converged||std::abs(t-21)>1e-10)throw std::runtime_error("Self-test: backward Euler heating failed");
+    stored.zero();stored_heat_rate<<<1,256>>>(4,capacity.p,x.p,old.p,.5,stored.p);
+    if(std::abs(stored.download()[0]-2)>1e-10)throw std::runtime_error("Self-test: transient energy storage failed");
     check(cudaGetLastError());
-    std::cout << "GPU self-tests passed: analytic tetrahedron, exact source load, consistent Robin matrix, PCG, convection/radiation/PCB heat.\n";
+    std::cout << "GPU self-tests passed: tetrahedron, sources, Robin matrix, PCG, boundary heat, capacity and transient adiabatic heating.\n";
 }
 
 int run(const fs::path &directory)
 {
     Input in(directory / "input.bin");
     auto v = parameters(directory / "parameters.txt");
+    bool transient=v.count("transient") && v.at("transient")!=0;
+    if(transient) for(double rc:in.rho_cp) if(!std::isfinite(rc)||rc<=0)
+        throw std::runtime_error("Transient input requires positive volumetric heat capacity");
     auto value = [&](const std::string &key)
     { return v.at(key); };
     Physics c{value("vin"), value("vout"), value("iout"), value("fsw"), value("inductance"), value("rhs_reference"), value("rls_reference"),
@@ -537,6 +570,9 @@ int run(const fs::path &directory)
     h.upload(in.h);
     eps.upload(in.eps);
     pcb.upload(in.pcb);
+    Device<double> capacity(in.n),rho_cp(in.nt),old_time(in.n),storage(1);
+    capacity.zero();rho_cp.upload(in.rho_cp);
+    double active_dt=0;
     Device<double> base(in.nnz), a(in.nnz), rhs(in.n), volume(in.nt), rv(in.nr), theta(in.n), candidate(in.n), integral(in.nr), maxt(in.nr), negmin(in.nr), mean(in.nr), power(in.nr), loss(9), flow(3), delta(1), kelvin(in.n);
     base.zero();
     rv.zero();
@@ -545,6 +581,10 @@ int run(const fs::path &directory)
     stiffness<<<blocks(in.nt), 256>>>(in.nt, tet.p, region.p, xyz.p, k.p, tslot.p, base.p, volume.p, rv.p, invalid.p);
     if (invalid.download()[0])
         throw std::runtime_error("Invalid tetrahedron or material conductivity");
+    if(transient) {
+        lumped_capacity<<<blocks(in.nt),256>>>(in.nt,tet.p,volume.p,rho_cp.p,capacity.p);
+        initial_field<<<blocks(in.n),256>>>(in.n,value("initial_temperature_k")-c.ambient,theta.p);
+    }
     auto volumes = rv.download();
     for (int r : {c.hs, c.ls, c.winding, c.magnetic})
         if (!(volumes[r] > 0))
@@ -554,63 +594,91 @@ int run(const fs::path &directory)
     auto update_losses = [&]()
     {losses<<<1,1>>>(c,mean.p,power.p,loss.p,invalid.p);if(invalid.download()[0])throw std::runtime_error("Temperature-dependent resistance outside model domain"); };
     auto assemble = [&]()
-    {check(cudaMemcpy(a.p,base.p,in.nnz*sizeof(double),cudaMemcpyDeviceToDevice));rhs.zero();source<<<blocks(in.nt),256>>>(in.nt,tet.p,region.p,volume.p,rv.p,power.p,rhs.p);boundary_matrix<<<blocks(in.nf),256>>>(in.nf,face.p,fslot.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,a.p,rhs.p);check(cudaGetLastError()); };
+    {check(cudaMemcpy(a.p,base.p,in.nnz*sizeof(double),cudaMemcpyDeviceToDevice));rhs.zero();source<<<blocks(in.nt),256>>>(in.nt,tet.p,region.p,volume.p,rv.p,power.p,rhs.p);boundary_matrix<<<blocks(in.nf),256>>>(in.nf,face.p,fslot.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,a.p,rhs.p);if(active_dt>0)time_matrix<<<blocks(in.n),256>>>(in.n,row.p,col.p,capacity.p,old_time.p,active_dt,a.p,rhs.p);check(cudaGetLastError()); };
     stats();
     update_losses();
     PCG pcg(in.n);
     std::ofstream history(directory / "history.tsv");
-    history << std::setprecision(17) << "outer\tpcg_iterations\tlinear_relative_residual\tnonlinear_relative_residual\tmax_change_K\tmax_loss_change_W\tpower_W\tconvection_W\tradiation_W\tpcb_W\tenergy_relative_error\n";
-    bool converged = false;
-    std::string reason = "maximum_outer_iterations";
-    int outer = 0;
-    PCGResult linear{0, 0, false};
-    double nonlinear = 0, change = 0, loss_change = 0, energy = 0;
-    auto components = loss.download();
-    std::vector<double> flows(3);
-    for (outer = 1; outer <= int(value("max_outer_iterations")); ++outer)
-    {
-        auto previous = components;
-        assemble();
-        check(cudaMemcpy(candidate.p, theta.p, in.n * sizeof(double), cudaMemcpyDeviceToDevice));
-        linear = pcg.solve(row.p, col.p, a.p, rhs.p, candidate.p, int(value("max_pcg_iterations")), value("pcg_relative_tolerance"), value("pcg_absolute_tolerance_w"));
-        delta.zero();
-        invalid.zero();
-        relax<<<blocks(in.n), 256>>>(in.n, candidate.p, value("relaxation"), c.ambient, value("maximum_temperature_k"), theta.p, delta.p, invalid.p);
-        if (invalid.download()[0])
-            throw std::runtime_error("Temperature limit/nonfinite state: stop; no validated thermal solution");
-        change = delta.download()[0];
-        stats();
-        update_losses();
-        components = loss.download();
-        loss_change = 0;
-        for (int j = 0; j < 8; ++j)
-            loss_change = std::max(loss_change, std::abs(components[j] - previous[j]));
-        flow.zero();
-        heat_flow<<<blocks(in.nf), 256>>>(in.nf, face.p, xyz.p, h.p, eps.p, pcb.p, theta.p, c.ambient, c.trad, flow.p);
-        flows = flow.download();
-        energy = std::abs(components[8] - flows[0] - flows[1] - flows[2]) / std::max(components[8], 1e-30);
-        // Reassemble at the accepted relaxed temperature and updated electrical loss.
-        assemble();
-        spmv<<<blocks(in.n), 256>>>(in.n, row.p, col.p, a.p, theta.p, pcg.ap.p);
-        residual<<<blocks(in.n), 256>>>(in.n, rhs.p, pcg.ap.p, pcg.r.p);
-        nonlinear = sqrt(pcg.dot(pcg.r.p, pcg.r.p)) / std::max(sqrt(pcg.dot(rhs.p, rhs.p)), 1e-30);
-        history << outer << '\t' << linear.iterations << '\t' << linear.relative_residual << '\t' << nonlinear << '\t' << change << '\t' << loss_change << '\t' << components[8] << '\t' << flows[0] << '\t' << flows[1] << '\t' << flows[2] << '\t' << energy << '\n';
-        history.flush();
-        std::cout << "outer " << outer << ": PCG " << linear.iterations << ", delta " << change << " K, loss " << components[8] << " W, energy error " << energy << std::endl;
-        if (!linear.converged)
-        {
-            reason = "linear_solver_did_not_converge";
-            break;
-        }
-        if (change <= value("temperature_tolerance_k") && loss_change <= value("loss_tolerance_w") && energy <= value("energy_relative_tolerance") && nonlinear <= value("nonlinear_relative_tolerance"))
-        {
-            converged = true;
-            reason = "converged";
-            break;
-        }
+    history << std::setprecision(17) << "time_s\tstep\touter\tpcg_iterations\tlinear_relative_residual\tnonlinear_relative_residual\tmax_change_K\tmax_loss_change_W\tpower_W\tconvection_W\tradiation_W\tpcb_W\tstorage_W\tenergy_relative_error\n";
+    bool converged=false;
+    std::string reason="maximum_outer_iterations";
+    int outer=0,step=0,total_outer=0;
+    PCGResult linear{0,0,false};
+    double nonlinear=0,change=0,loss_change=0,energy=0,stored=0,time=0,last_snapshot=-1;
+    auto components=loss.download();std::vector<double> flows(3);
+    double accepted_stored=0,accepted_energy=1;
+    std::ofstream frame_times,frame_data,time_history;
+    if(transient) {
+        frame_times.open(directory/"transient_times.txt");frame_times<<std::setprecision(17);
+        frame_data.open(directory/"transient_temperature.bin",std::ios::binary);
+        time_history.open(directory/"time_history.tsv");
+        time_history<<std::setprecision(17)<<"time_s\tstep\tinner_iterations\tmaximum_temperature_K\tpower_W\tconvection_W\tradiation_W\tpcb_W\tstorage_W\tenergy_relative_error\n";
     }
-    if (outer > int(value("max_outer_iterations")))
-        outer = int(value("max_outer_iterations"));
+    auto snapshot=[&](double t) {
+        absolute_temperature<<<blocks(in.n),256>>>(in.n,theta.p,c.ambient,kelvin.p);
+        auto values=kelvin.download();frame_times<<t<<'\n';
+        frame_data.write(reinterpret_cast<const char*>(values.data()),values.size()*sizeof(double));
+        frame_data.flush();frame_times.flush();last_snapshot=t;
+    };
+    if(transient)snapshot(0);
+    do {
+        ++step;converged=false;
+        double target=transient?std::min(time+value("time_step_s"),value("duration_s")):0;
+        if(transient && value("duration_s")-target <= 1e-12*value("duration_s"))target=value("duration_s");
+        active_dt=transient?target-time:0;
+        if(transient)check(cudaMemcpy(old_time.p,theta.p,in.n*sizeof(double),cudaMemcpyDeviceToDevice));
+        for(outer=1;outer<=int(value("max_outer_iterations"));++outer) {
+            ++total_outer;auto previous=components;assemble();
+            check(cudaMemcpy(candidate.p,theta.p,in.n*sizeof(double),cudaMemcpyDeviceToDevice));
+            double linear_abs=value("pcg_absolute_tolerance_w");
+            if(transient)linear_abs=std::min(linear_abs,.1*value("nonlinear_relative_tolerance")*std::max(components[8],1e-12)/std::sqrt(double(in.n)));
+            linear=pcg.solve(row.p,col.p,a.p,rhs.p,candidate.p,int(value("max_pcg_iterations")),transient?0:value("pcg_relative_tolerance"),linear_abs);
+            delta.zero();invalid.zero();
+            relax<<<blocks(in.n),256>>>(in.n,candidate.p,value("relaxation"),c.ambient,value("maximum_temperature_k"),theta.p,delta.p,invalid.p);
+            if(invalid.download()[0])throw std::runtime_error("Temperature limit/nonfinite state: no validated thermal solution");
+            change=delta.download()[0];stats();update_losses();components=loss.download();loss_change=0;
+            for(int j=0;j<8;++j)loss_change=std::max(loss_change,std::abs(components[j]-previous[j]));
+            flow.zero();heat_flow<<<blocks(in.nf),256>>>(in.nf,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,flow.p);
+            flows=flow.download();stored=0;
+            if(transient) {
+                storage.zero();stored_heat_rate<<<blocks(in.n),256>>>(in.n,capacity.p,theta.p,old_time.p,active_dt,storage.p);
+                stored=storage.download()[0];
+            }
+            energy=std::abs(components[8]-flows[0]-flows[1]-flows[2]-stored)/std::max(components[8],1e-30);
+            assemble();spmv<<<blocks(in.n),256>>>(in.n,row.p,col.p,a.p,theta.p,pcg.ap.p);
+            residual<<<blocks(in.n),256>>>(in.n,rhs.p,pcg.ap.p,pcg.r.p);
+            // Scale residual by physical source/boundary power, not the potentially
+            // large M*T_old/dt right-hand side, which could hide spatial errors.
+            double rhs_scale=0;
+            if(transient) {
+                // energy tolerance and temperature/loss tolerances also gate acceptance.
+                rhs_scale=std::max(components[8]/std::sqrt(double(in.n)),1e-30);
+            } else rhs_scale=std::max(sqrt(pcg.dot(rhs.p,rhs.p)),1e-30);
+            nonlinear=sqrt(pcg.dot(pcg.r.p,pcg.r.p))/rhs_scale;
+            history<<target<<'\t'<<step<<'\t'<<outer<<'\t'<<linear.iterations<<'\t'<<linear.relative_residual<<'\t'<<nonlinear<<'\t'<<change<<'\t'<<loss_change<<'\t'<<components[8]<<'\t'<<flows[0]<<'\t'<<flows[1]<<'\t'<<flows[2]<<'\t'<<stored<<'\t'<<energy<<'\n';history.flush();
+            if(!linear.converged){reason="linear_solver_did_not_converge";break;}
+            if(change<=value("temperature_tolerance_k")&&loss_change<=value("loss_tolerance_w")&&energy<=value("energy_relative_tolerance")&&nonlinear<=value("nonlinear_relative_tolerance")) {
+                converged=true;reason=transient?"time_steps_converged":"converged";break;
+            }
+        }
+        if(!converged) {
+            if(reason!="linear_solver_did_not_converge")reason="maximum_outer_iterations";
+            if(transient) {
+                check(cudaMemcpy(theta.p,old_time.p,in.n*sizeof(double),cudaMemcpyDeviceToDevice));
+                stats();update_losses();components=loss.download();
+                stored=accepted_stored;energy=accepted_energy;
+                flow.zero();heat_flow<<<blocks(in.nf),256>>>(in.nf,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,flow.p);flows=flow.download();
+            }
+            break;
+        }
+        if(transient) {
+            time=target;accepted_stored=stored;accepted_energy=energy;auto max_by_region=maxt.download();double maximum=*std::max_element(max_by_region.begin(),max_by_region.end());
+            time_history<<time<<'\t'<<step<<'\t'<<outer<<'\t'<<maximum<<'\t'<<components[8]<<'\t'<<flows[0]<<'\t'<<flows[1]<<'\t'<<flows[2]<<'\t'<<stored<<'\t'<<energy<<'\n';time_history.flush();
+            if(step%int(value("snapshot_stride"))==0||time>=value("duration_s"))snapshot(time);
+        }
+        std::cout<<(transient?"time ":"steady solve ")<<(transient?time:0)<<" s: nonlinear iterations "<<outer<<", loss "<<components[8]<<" W, energy error "<<energy<<std::endl;
+    } while(transient && time<value("duration_s"));
+    if(transient && time>last_snapshot)snapshot(time);
     absolute_temperature<<<blocks(in.n), 256>>>(in.n, theta.p, c.ambient, kelvin.p);
     auto temperature = kelvin.download();
     std::ofstream binary(directory / "temperature.bin", std::ios::binary);
@@ -625,7 +693,11 @@ int run(const fs::path &directory)
     const char *labels[] = {"high_side_conduction", "high_side_switching", "low_side_conduction", "dead_time_diode", "winding_dc", "winding_ac", "core_unvalidated_placeholder", "auxiliary_ic"};
     std::ofstream json(directory / "solution.json");
     json << std::setprecision(17);
-    json << "{\n\"converged\":" << (converged ? "true" : "false") << ",\n\"status\":\"" << reason << "\",\n\"outer_iterations\":" << outer << ",\n\"total_loss_w\":" << components[8] << ",\n\"output_power_w\":" << c.vout * c.iout << ",\n\"efficiency\":" << (c.vout * c.iout) / (c.vout * c.iout + components[8]) << ",\n\"convection_w\":" << flows[0] << ",\n\"radiation_w\":" << flows[1] << ",\n\"pcb_w\":" << flows[2] << ",\n\"energy_balance_relative_error\":" << energy << ",\n\"nonlinear_relative_residual\":" << nonlinear << ",\n\"losses_w\":{";
+    json << "{\n\"mode\":\""<<(transient?"transient":"steady_state")<<"\",\n\"steady_state\":"<<(transient?"false":"true")
+         <<",\n\"time_s\":"<<time<<",\n\"requested_duration_s\":"<<(transient?value("duration_s"):0)
+         <<",\n\"accepted_time_steps\":"<<(transient?(converged?step:step-1):0)
+         <<",\n\"storage_w\":"<<stored<<",\n\"time_steps_attempted\":"<<(transient?step:0)<<",\n";
+    json << "\"converged\":" << (converged ? "true" : "false") << ",\n\"status\":\"" << reason << "\",\n\"outer_iterations\":" << total_outer << ",\n\"total_loss_w\":" << components[8] << ",\n\"output_power_w\":" << c.vout * c.iout << ",\n\"efficiency\":" << (c.vout * c.iout) / (c.vout * c.iout + components[8]) << ",\n\"convection_w\":" << flows[0] << ",\n\"radiation_w\":" << flows[1] << ",\n\"pcb_w\":" << flows[2] << ",\n\"energy_balance_relative_error\":" << energy << ",\n\"nonlinear_relative_residual\":" << nonlinear << ",\n\"losses_w\":{";
     for (int j = 0; j < 8; ++j)
         json << (j ? "," : "") << '\"' << labels[j] << "\":" << components[j];
     json << "},\n\"regions\":[";

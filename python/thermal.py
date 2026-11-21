@@ -17,7 +17,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def prepare(config_path, mesh_dir, output):
+def prepare(config_path, mesh_dir, output, transient=False):
     config = yaml.safe_load(config_path.read_text())
     settings = config['thermal']
     losses, cooling, solver = (settings[k] for k in ('losses','cooling','solver'))
@@ -47,11 +47,18 @@ def prepare(config_path, mesh_dir, output):
         raise ValueError('Required thermal component mesh regions are missing')
     catalog = config['materials']['thermal']
     conductivity = np.empty(len(tet),dtype='<f8')
+    heat_capacity = np.zeros(len(tet),dtype='<f8')
     for i,region in report['regions'].items():
         k = catalog[region['material']]['thermal_conductivity_w_m_k']
         if not isinstance(k,(float,int)) or not np.isfinite(k) or k <= 0:
             raise ValueError('This implementation needs positive scalar isotropic conductivity')
         conductivity[regions==int(i)] = k
+        properties=catalog[region['material']]
+        rho,cp=properties.get('density_kg_m3'),properties.get('specific_heat_j_kg_k')
+        if all(isinstance(v,(float,int)) and np.isfinite(v) and v>0 for v in (rho,cp)):
+            heat_capacity[regions==int(i)]=rho*cp
+        elif transient:
+            raise ValueError('Transient solving requires positive density and specific heat for every material')
         region['thermal_properties'] = catalog[region['material']]
     # Geometry processing only: identify each exterior face's actual material.
     all_faces = np.sort(np.concatenate([tet[:,f] for f in ((0,1,2),(0,1,3),(0,2,3),(1,2,3))]),axis=1)
@@ -127,6 +134,14 @@ def prepare(config_path, mesh_dir, output):
         ambient_k=cooling['ambient_temperature_k'],radiation_k=cooling['radiation_temperature_k'],
         hs_region=names['high_side_fet'],ls_region=names['low_side_fet'],winding_region=names['copper_winding'],core_region=names['metal_composite'])
     parameters.update(solver)
+    temporal=settings.get('transient',{})
+    parameters.update(transient=int(transient),time_step_s=temporal.get('time_step_s',0.1),
+        duration_s=temporal.get('duration_s',60.0),snapshot_stride=temporal.get('snapshot_stride',5),
+        initial_temperature_k=temporal.get('initial_temperature_k',cooling['ambient_temperature_k']))
+    if min(parameters[k] for k in ('time_step_s','duration_s','initial_temperature_k'))<=0 or parameters['snapshot_stride']<1 or int(parameters['snapshot_stride'])!=parameters['snapshot_stride']:
+        raise ValueError('Invalid transient time step, duration, initial temperature, or snapshot stride')
+    if parameters['initial_temperature_k']>solver['maximum_temperature_k']:
+        raise ValueError('Initial temperature exceeds model temperature limit')
     if not (0<parameters['vout']<parameters['vin']) or min(parameters['iout'],parameters['fsw'],parameters['inductance'])<=0:
         raise ValueError('Invalid buck operating point')
     ripple=parameters['vout']*(1-parameters['vout']/parameters['vin'])/(parameters['inductance']*parameters['fsw'])
@@ -150,9 +165,9 @@ def prepare(config_path, mesh_dir, output):
         raise ValueError('Mesh exceeds int32 connectivity support')
     output.mkdir(parents=True,exist_ok=True)
     with (output/'input.bin').open('wb') as f:
-        f.write(b'POLTHM01')
+        f.write(b'POLTHM02')
         f.write(struct.pack('<5i',len(points),len(tet),len(boundary),int(regions.max())+1,csr.nnz))
-        for array in (points,tet,regions,conductivity,boundary,h,epsilon,pcb,tet_slots,face_slots,rowptr,columns):
+        for array in (points,tet,regions,conductivity,boundary,h,epsilon,pcb,tet_slots,face_slots,rowptr,columns,heat_capacity):
             f.write(np.ascontiguousarray(array).tobytes())
     (output/'parameters.txt').write_text(''.join(f'{k} {v:.17g}\n' for k,v in parameters.items()))
     record = dict(mesh_dir=str(mesh_dir.resolve()),config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
@@ -160,10 +175,42 @@ def prepare(config_path, mesh_dir, output):
         assumptions=settings,pcb_contact_area_m2=contact_area,pcb_conductance_w_k=float(np.dot(pcb,area)),
         radiation_excluded_on_pcb_contact=True,control_logic_heat_source=False,auxiliary_loss_w=0,
         mesh_quality=report.get('quality_status'),illustrative_winding=report.get('illustrative_winding'),
-        method='conforming P1 tetrahedral FEM; consistent Robin matrices; three-point triangle radiation quadrature')
+        mode='transient' if transient else 'steady_state',
+        time_parameters={k:parameters[k] for k in ('time_step_s','duration_s','snapshot_stride','initial_temperature_k')},
+        method='conforming P1 tetrahedral FEM; consistent Robin matrices; three-point triangle radiation quadrature',
+        time_discretization='backward Euler with lumped nodal heat capacity' if transient else None)
     (output/'input.json').write_text(json.dumps(record,indent=2)+'\n')
     print(f'Prepared {len(points):,} nodes, {len(tet):,} tetrahedra, {len(boundary):,} exterior faces; no CPU solve.',flush=True)
     return record
+
+
+def postprocess_series(directory, mesh, record, result):
+    """Compact nodal time history: reuse one mesh, rather than duplicating geometry per frame."""
+    times=np.loadtxt(directory/'transient_times.txt',ndmin=1)
+    raw=np.fromfile(directory/'transient_temperature.bin',dtype='<f8')
+    if raw.size!=len(times)*mesh.n_points or len(times)==0 or not np.all(np.isfinite(raw)):
+        raise ValueError('Invalid transient snapshot data')
+    temperatures=raw.reshape(len(times),mesh.n_points)
+    if times[0]!=0 or np.any(np.diff(times)<=0):
+        raise ValueError('Transient times must start at zero and strictly increase')
+    if not np.isclose(times[-1],result['time_s']) or not np.allclose(temperatures[-1],mesh.point_data['temperature_K']):
+        raise ValueError('Final transient snapshot does not match the accepted final state')
+    np.savez_compressed(directory/'temperature_series.npz',time_s=times,temperature_K=temperatures,
+        mesh_file=np.array('temperature.vtu'),series_kind=np.array('physical_transient'),
+        complete=np.array(bool(result['converged'])))
+    # Component means are postprocessing of the GPU snapshots, never a CPU time solve.
+    source=np.load(Path(record['mesh_dir'])/'module.npz')
+    tet=source['tetrahedra'];vol=source['element_volume_mm3'];rid=source['region_id']
+    names=[];means=[];maximum=[]
+    for i,r in record['regions'].items():
+        mask=rid==int(i);nodes=np.unique(tet[mask]);names.append(r['name'])
+        weights=np.zeros(mesh.n_points)
+        np.add.at(weights,tet[mask].ravel(),np.repeat(vol[mask]/4,4))
+        means.append(temperatures@weights/vol[mask].sum()-273.15)
+        maximum.append(temperatures[:,nodes].max(axis=1)-273.15)
+    np.savez_compressed(directory/'component_time_history.npz',time_s=times,
+        names=np.array(names),mean_temperature_C=np.array(means),maximum_temperature_C=np.array(maximum))
+    return times,temperatures
 
 
 def postprocess(directory):
@@ -195,6 +242,9 @@ def postprocess(directory):
             volume_average_c=float(np.average(mean[mask],weights=volumes[mask])-273.15),power_w=powers[int(i)])
     mesh.cell_data['heat_generation_W_m3']=q
     mesh.save(directory/'temperature.vtu')
+    series=None
+    if result.get('mode')=='transient':
+        series=postprocess_series(directory,mesh,record,result)
     for i,r in record['regions'].items():
         if r['name'] in ('high_side_fet','low_side_fet','copper_winding','metal_composite'):
             mesh.extract_cells(region_id==int(i)).save(components/(r['name']+'.vtu'))
@@ -225,10 +275,17 @@ def postprocess(directory):
     axes[0,1].set_ylabel('Loss (W)')
     axes[1,0].bar(['Convection','Radiation','PCB'],[result[k] for k in ('convection_w','radiation_w','pcb_w')]);axes[1,0].set_ylabel('Heat out (W)')
     history=np.genfromtxt(directory/'history.tsv',names=True,delimiter='\t',ndmin=1)
-    for key in ('nonlinear_relative_residual','energy_relative_error'):
-        axes[1,1].semilogy(history['outer'],np.maximum(history[key],1e-16),label=key)
-    axes[1,1].set_xlabel('Nonlinear iteration');axes[1,1].legend(fontsize=8)
-    fig.suptitle(('Converged' if result['converged'] else 'NOT CONVERGED')+' — preliminary thermal model')
+    if series is None:
+        for key in ('nonlinear_relative_residual','energy_relative_error'):
+            axes[1,1].semilogy(history['outer'],np.maximum(history[key],1e-16),label=key)
+        axes[1,1].set_xlabel('Nonlinear iteration')
+    else:
+        times,temperatures=series
+        axes[1,1].plot(times,temperatures.max(axis=1)-273.15,label='Module maximum')
+        axes[1,1].set_xlabel('Physical time (s)');axes[1,1].set_ylabel('Temperature (C)')
+    axes[1,1].legend(fontsize=8)
+    label=('Transient: saved time steps converged' if result.get('mode')=='transient' else 'Converged') if result['converged'] else 'NOT COMPLETED / NOT CONVERGED'
+    fig.suptitle(label+' — preliminary thermal model')
     fig.savefig(directory/'summary.png',dpi=160);plt.close(fig)
     print('Wrote temperature.vtu, component maps, and report.json; converged =',result['converged'])
 
@@ -237,17 +294,20 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,default=ROOT/'config.yaml')
     p.add_argument('--mesh-dir',type=Path,default=ROOT/'output'/'mesh')
-    p.add_argument('--output-dir',type=Path,default=ROOT/'output'/'thermal')
+    p.add_argument('--output-dir',type=Path)
+    p.add_argument('--transient',action='store_true',help='Solve physical time evolution with CUDA, not nonlinear-iteration playback')
     p.add_argument('--solver',type=Path,default=ROOT/'build'/'thermal')
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--postprocess-only',action='store_true')
     a=p.parse_args()
+    a.output_dir=a.output_dir or ROOT/'output'/('thermal_transient' if a.transient else 'thermal')
     if a.postprocess_only:
         postprocess(a.output_dir);return
-    prepare(a.config,a.mesh_dir,a.output_dir)
+    prepare(a.config,a.mesh_dir,a.output_dir,a.transient)
     if a.prepare_only:return
     # Remove stale outputs so a failed GPU run cannot look like new results.
-    for name in ('solution.json','temperature.bin','report.json','temperature.vtu','history.tsv','summary.png'):
+    for name in ('solution.json','temperature.bin','report.json','temperature.vtu','history.tsv','summary.png',
+                 'transient_times.txt','transient_temperature.bin','temperature_series.npz','component_time_history.npz','time_history.tsv'):
         (a.output_dir/name).unlink(missing_ok=True)
     if (a.output_dir/'components').is_dir():
         for old in (a.output_dir/'components').glob('*.vtu'):old.unlink()

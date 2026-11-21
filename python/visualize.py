@@ -8,17 +8,28 @@ import yaml
 from geometry import DATA, ROOT, build_model, export_model, plot_model
 
 
-def mesh_view(data, scalar=None, report=None, off_screen=False):
+def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
     """Show actual element faces with a movable, whole-cell cutaway."""
     import numpy as np
     import pyvista as pv
 
     if not isinstance(data,pv.UnstructuredGrid):
         data = data.cast_to_unstructured_grid()
+    if series is not None:
+        times,temperatures=series['time_s'],series['temperature_K']
+        if temperatures.shape!=(len(times),data.n_points) or len(times)==0 or not np.all(np.isfinite(temperatures)):
+            raise ValueError('Time-series temperatures do not match the mesh')
+        if not np.all(np.isfinite(times)) or times[0]!=0 or np.any(np.diff(times)<=0):
+            raise ValueError('Invalid physical snapshot times')
+        data.point_data['_thermal_node_index']=np.arange(data.n_points)
+        data.point_data['temperature_K']=temperatures[0]
+        data.point_data['temperature_C']=temperatures[0]-273.15
     plotter = pv.Plotter(off_screen=off_screen,window_size=(1400,900))
     plotter.set_background('white')
     scalar = scalar or ('temperature_C' if 'temperature_C' in data.point_data else
                         'region_id' if 'region_id' in data.cell_data else None)
+    if series is not None and scalar not in ('temperature_C','temperature_K','mean_temperature_C','region_id','quality_minSICN'):
+        raise ValueError('Time playback supports temperature and static mesh fields only')
     report = report or {}
     regions = report.get('regions',{})
     if isinstance(regions,list):
@@ -27,6 +38,9 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
     actors, originals = {}, {}
     state = dict(cutaway=True,slice=False,edges=True,normal=(0,1,0),origin=data.center)
     clim = data.get_data_range(scalar) if scalar else None
+    if series is not None and scalar in ('temperature_C','temperature_K','mean_temperature_C'):
+        offset=0 if scalar=='temperature_K' else 273.15
+        clim=(float(temperatures.min()-offset),float(temperatures.max()-offset))
     for i,region_id in enumerate(ids):
         key = str(int(region_id)) if region_id is not None else 'mesh'
         grid = data.threshold([region_id,region_id],scalars='region_id') if region_id is not None else data
@@ -78,7 +92,7 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
 
     plotter.add_text('Temperature (C)' if scalar=='temperature_C' else 'Mesh display',position=(14,865),font_size=13,color='black')
     if scalar=='temperature_C' and report.get('converged') is False:
-        plotter.add_text('NOT CONVERGED: diagnostic iterate',position=(450,865),font_size=12,color='red')
+        plotter.add_text('PARTIAL TRANSIENT' if report.get('mode')=='transient' else 'NOT CONVERGED: diagnostic iterate',position=(450,865),font_size=12,color='red')
     checkbox('Element edges',set_edges,825)
     checkbox('Cutaway (drag plane)',set_cutaway,790)
     checkbox('Slice only',set_slice,755,value=False)
@@ -96,9 +110,57 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
     plotter.add_axes(viewport=(0.86,0.80,1.0,1.0))
     plotter.view_vector((1,-1,0.8),viewup=(0,0,1))
     plotter.reset_camera(bounds=data.bounds)
+    time_controls={}
+    if series is not None:
+        state.update(frame=0,playing=False)
+        label=plotter.add_text('Physical time: 0 s',position=(450,825),font_size=12,color='black')
+        slider=None;play_widget=None
+        def set_frame(index):
+            index=max(0,min(int(index),len(times)-1));state['frame']=index
+            frame=temperatures[index]
+            for grid in originals.values():
+                temperature=frame[grid.point_data['_thermal_node_index']]
+                grid.point_data['temperature_K']=temperature
+                grid.point_data['temperature_C']=temperature-273.15
+                if 'mean_temperature_C' in grid.cell_data:
+                    grid.cell_data['mean_temperature_C']=temperature[grid.cells.reshape(-1,5)[:,1:]].mean(axis=1)-273.15
+            label.SetInput(f'Physical time: {times[index]:.6g} s   |   frame {index+1}/{len(times)}')
+            if slider is not None:slider.GetRepresentation().SetValue(float(times[index]))
+            update_plane(state['normal'],state['origin'])
+        def set_playing(value):
+            state['playing']=bool(value) and len(times)>1
+            if state['playing'] and state['frame']==len(times)-1:set_frame(0)
+            if play_widget is not None:play_widget.GetRepresentation().SetState(int(state['playing']))
+            plotter.render()
+        def scrub(time):
+            set_playing(False)
+            set_frame(np.argmin(np.abs(times-time)))
+        def tick(_=None):
+            if not state['playing']:return
+            if state['frame']>=len(times)-1:set_playing(False)
+            else:
+                set_frame(state['frame']+1)
+                if state['frame']==len(times)-1:set_playing(False)
+        if len(times)>1:
+            slider=plotter.add_slider_widget(scrub,(float(times[0]),float(times[-1])),value=float(times[0]),
+                title='Physical time (s)',pointa=(.36,.16),pointb=(.93,.16),interaction_event='always',
+                style='modern',fmt='%.3g',title_height=.025)
+            play_widget=plotter.add_checkbox_button_widget(set_playing,value=False,position=(14,345),size=20,
+                border_size=1,color_on='#356b9a',color_off='lightgray')
+            plotter.add_text('Play / pause (Space)',position=(44,345),font_size=10,color='black')
+            plotter.add_text('Arrow keys: previous / next frame',position=(14,310),font_size=9,color='black')
+            plotter.add_key_event('space',lambda:set_playing(not state['playing']))
+            def step_frame(delta):
+                set_playing(False);set_frame(state['frame']+delta)
+            plotter.add_key_event('Left',lambda:step_frame(-1))
+            plotter.add_key_event('Right',lambda:step_frame(1))
+            if not off_screen:plotter.add_timer_event(max_steps=2**31-1,duration=150,callback=tick)
+        set_frame(0)
+        time_controls=dict(set_frame=set_frame,set_playing=set_playing,tick=tick,slider=slider)
     # Retain callback references and make visibility/clip checks possible offscreen.
     plotter._mesh_view = dict(actors=actors,originals=originals,state=state,plane=plane,
-                             update_plane=update_plane,set_edges=set_edges,set_cutaway=set_cutaway,set_slice=set_slice)
+                             update_plane=update_plane,set_edges=set_edges,set_cutaway=set_cutaway,set_slice=set_slice,
+                             **time_controls)
     return plotter
 
 
@@ -127,12 +189,23 @@ def main():
     if not args.input.is_file():
         parser.error(f"File not found: {args.input}")
     import pyvista as pv
-    data = pv.read(args.input)
+    import numpy as np
+    series_path=args.input if args.input.suffix=='.npz' else args.input.with_name('temperature_series.npz') if args.input.name=='temperature.vtu' else None
+    series=None
+    if series_path is not None and series_path.is_file():
+        with np.load(series_path,allow_pickle=False) as bundle:
+            if str(bundle['series_kind'])!='physical_transient':
+                parser.error('Expected a physical transient temperature time series')
+            series={key:bundle[key].copy() for key in ('time_s','temperature_K')}
+            mesh_path=series_path.parent/str(bundle['mesh_file'])
+        data=pv.read(mesh_path)
+    else:
+        data = pv.read(args.input)
     if args.scalar and args.scalar not in data.array_names:
         parser.error(f'Field not found: {args.scalar}')
     report_path = args.input.with_name('report.json')
     report = json.loads(report_path.read_text()) if report_path.is_file() else None
-    plotter = mesh_view(data,args.scalar,report,off_screen=bool(args.screenshot))
+    plotter = mesh_view(data,args.scalar,report,off_screen=bool(args.screenshot),series=series)
     if args.screenshot:
         args.screenshot.parent.mkdir(parents=True,exist_ok=True)
     plotter.show(screenshot=str(args.screenshot) if args.screenshot else None)

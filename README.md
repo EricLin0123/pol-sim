@@ -34,8 +34,8 @@ Jacobi-preconditioned conjugate gradients in double precision. Shared interface
 nodes enforce temperature continuity and conservative assembled heat balance;
 cellwise gradients need not have identical pointwise face fluxes. Source powers
 are normalized by actual meshed region volume, then audited by integrating them.
-Steady state uses conductivity; density and heat capacity are retained for later
-transient work but do not enter this equation.
+Steady state uses conductivity; density and heat capacity enter the optional
+transient mode below.
 
 All assumed losses, reference temperatures, temperature coefficients, still-air
 boundary coefficients, emissivities, the uncertain lumped PCB path and solver
@@ -81,6 +81,48 @@ has been established. Contact resistances, temperature-dependent material
 conductivity, saturation, AC winding physics and switching waveforms are not
 modeled. The specified lumped PCB path and fixed core loss are uncertain inputs,
 so even a converged numerical result is a preliminary model prediction.
+
+## Temperature evolution and playback
+
+```sh
+cmake --build build -j 2
+uv run python/thermal.py --transient
+uv run python/visualize.py output/thermal_transient/temperature.vtu
+```
+
+The temperature viewer automatically detects the adjacent time-series file.
+Use the **Physical time** slider, **Play / pause**, Space, or the arrow keys to
+advance through saved frames. Slicing, clipping, material toggles, and element
+edges remain available during playback. The temperature color scale stays fixed
+over the entire series so changing colors represent changing temperatures.
+Playback speed is a display setting (150 ms per saved frame), not physical time.
+You can also open `output/thermal_transient/temperature_series.npz` directly.
+
+Transient mode solves `rho*Cp*dT/dt - div(k*grad(T)) = q` with lumped nodal
+heat capacity and first-order implicit backward Euler, entirely on CUDA.
+Each time step converges temperature-dependent losses and radiation before
+acceptance. Energy accounting includes `sum(C_i*(T_i_new-T_i_old))/dt`; it does
+not require instantaneous heat removal to equal generation during warm-up.
+Nonlinear solver iterations are never presented as elapsed physical time.
+
+Local `thermal.transient` controls `initial_temperature_k`, `time_step_s`,
+`duration_s`, and `snapshot_stride`. Initial settings use ambient temperature,
+0.1 s steps for 60 s, with a snapshot every five accepted steps plus the initial
+and final states. The configured full electrical load is applied at t=0.
+These initial discretization settings need time-step refinement and can smear
+fast die transients. A completed time interval is not automatically steady state.
+Composite density/specific heat retain their supplied uncertainty markers;
+the lumped PCB path has no board thermal inertia.
+
+`output/thermal_transient/` contains the normal final-state outputs plus
+`temperature_series.npz` (physical times and nodal Kelvin temperatures),
+`component_time_history.npz` (component mean/max temperatures), and
+`time_history.tsv` (heat generation, removal, storage, and energy error per step).
+One mesh is reused across all frames. Only accepted steps are saved; failed
+steps roll back and produce an explicitly partial history. The CUDA self-test
+includes an analytic adiabatic heating step and energy-storage check. Both time
+integration and its GPU tests require a working NVIDIA driver; no CPU solver or
+invented thermal animation is substituted if CUDA is unavailable.
 
 ## Volume meshing (no solver)
 

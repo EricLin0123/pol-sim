@@ -79,4 +79,4 @@ simulation:
   time_step_s: null
   duration_s: null
 
-thermal: null # Local steady-state loss, still-air boundary, and CUDA solver assumptions.
+thermal: null # Local loss/cooling/CUDA settings and optional transient initial temperature, dt, duration, snapshot stride.
