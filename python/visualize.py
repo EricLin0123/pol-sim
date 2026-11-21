@@ -13,14 +13,19 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
     import numpy as np
     import pyvista as pv
 
+    if not isinstance(data,pv.UnstructuredGrid):
+        data = data.cast_to_unstructured_grid()
     plotter = pv.Plotter(off_screen=off_screen,window_size=(1400,900))
     plotter.set_background('white')
-    scalar = scalar or ('region_id' if 'region_id' in data.cell_data else None)
+    scalar = scalar or ('temperature_C' if 'temperature_C' in data.point_data else
+                        'region_id' if 'region_id' in data.cell_data else None)
     report = report or {}
     regions = report.get('regions',{})
+    if isinstance(regions,list):
+        regions = report.get('input',{}).get('regions',{})
     ids = np.unique(data.cell_data['region_id']) if 'region_id' in data.cell_data else [None]
     actors, originals = {}, {}
-    state = dict(cutaway=True,edges=True,normal=(0,1,0),origin=data.center)
+    state = dict(cutaway=True,slice=False,edges=True,normal=(0,1,0),origin=data.center)
     clim = data.get_data_range(scalar) if scalar else None
     for i,region_id in enumerate(ids):
         key = str(int(region_id)) if region_id is not None else 'mesh'
@@ -41,7 +46,8 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
         state.update(normal=normal,origin=origin)
         for key,actor in actors.items():
             grid = originals[key]
-            actor.mapper.dataset = grid.clip(normal=normal,origin=origin,invert=False,crinkle=True) if state['cutaway'] else grid
+            actor.mapper.dataset = (grid.slice(normal=normal,origin=origin).cast_to_unstructured_grid() if state['slice'] else
+                grid.clip(normal=normal,origin=origin,invert=False,crinkle=True) if state['cutaway'] else grid)
         plotter.reset_camera_clipping_range()
         plotter.render()
 
@@ -57,18 +63,26 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
 
     def set_cutaway(value):
         state['cutaway'] = bool(value)
-        plane.SetEnabled(bool(value))
+        plane.SetEnabled(bool(value) or state['slice'])
         update_plane(state['normal'],state['origin'])
 
-    def checkbox(label,callback,y):
-        plotter.add_checkbox_button_widget(callback,value=True,position=(14,y),size=20,
+    def set_slice(value):
+        state['slice'] = bool(value)
+        plane.SetEnabled(bool(value) or state['cutaway'])
+        update_plane(state['normal'],state['origin'])
+
+    def checkbox(label,callback,y,value=True):
+        plotter.add_checkbox_button_widget(callback,value=value,position=(14,y),size=20,
             border_size=1,color_on='#356b9a',color_off='lightgray')
         plotter.add_text(label,position=(44,y),font_size=10,color='black')
 
-    plotter.add_text('Mesh display',position=(14,865),font_size=13,color='black')
+    plotter.add_text('Temperature (C)' if scalar=='temperature_C' else 'Mesh display',position=(14,865),font_size=13,color='black')
+    if scalar=='temperature_C' and report.get('converged') is False:
+        plotter.add_text('NOT CONVERGED: diagnostic iterate',position=(450,865),font_size=12,color='red')
     checkbox('Element edges',set_edges,825)
     checkbox('Cutaway (drag plane)',set_cutaway,790)
-    plotter.add_text('Visible regions',position=(14,745),font_size=11,color='black')
+    checkbox('Slice only',set_slice,755,value=False)
+    plotter.add_text('Visible regions',position=(14,710),font_size=11,color='black')
     names = {'ic_emc':'IC package EMC','copper_pins':'Copper pins','silicon_background':'Silicon die',
              'high_side_fet':'High-side FET','low_side_fet':'Low-side FET',
              'metal_composite':'Magnetic composite','copper_terminals':'Copper terminals','copper_winding':'Copper winding'}
@@ -76,15 +90,15 @@ def mesh_view(data, scalar=None, report=None, off_screen=False):
         name = regions.get(key,{}).get('name',f'Region {key}' if key!='mesh' else 'Mesh')
         def visible(value, actor=actors[key]):
             actor.SetVisibility(bool(value));plotter.render()
-        checkbox(names.get(name,name),visible,705-i*33)
-    plotter.add_text('Drag the plane center to cut deeper.\nDrag its normal to change direction.\nWhole tetrahedra are retained.',
+        checkbox(names.get(name,name),visible,670-i*33)
+    plotter.add_text('Drag the plane center to cut deeper.\nDrag its normal to change direction.\nSlice only interpolates on the plane.',
                      position=(14,80),font_size=9,color='black')
     plotter.add_axes(viewport=(0.86,0.80,1.0,1.0))
     plotter.view_vector((1,-1,0.8),viewup=(0,0,1))
     plotter.reset_camera(bounds=data.bounds)
     # Retain callback references and make visibility/clip checks possible offscreen.
     plotter._mesh_view = dict(actors=actors,originals=originals,state=state,plane=plane,
-                             update_plane=update_plane,set_edges=set_edges,set_cutaway=set_cutaway)
+                             update_plane=update_plane,set_edges=set_edges,set_cutaway=set_cutaway,set_slice=set_slice)
     return plotter
 
 

@@ -78,3 +78,5 @@ simulation:
   initial_temperature_k: null
   time_step_s: null
   duration_s: null
+
+thermal: null # Local steady-state loss, still-air boundary, and CUDA solver assumptions.

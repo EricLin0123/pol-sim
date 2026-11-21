@@ -3,8 +3,84 @@
 Research foundation for **CUDA-Accelerated Thermal and Electromagnetic Simulation
 of Integrated-Inductor DC-DC Power Modules**, including top liquid cooling.
 All numerical solvers will use CUDA C++17; Python handles geometry, processing,
-plots, animation, interactive viewing, and Gmsh volume meshing. No thermal/EM
-solver or loss estimates are implemented yet.
+plots, animation, interactive viewing, and Gmsh volume meshing. Steady-state
+thermal assembly and solving use native CUDA C++; EM remains a scaffold.
+
+## Steady-state thermal simulation (CUDA only)
+
+With the existing mesh and populated local `config.yaml`:
+
+```sh
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=native
+cmake --build build -j 2
+./build/thermal --self-test
+uv run python/thermal.py
+uv run python/visualize.py output/thermal/temperature.vtu
+uv run python/visualize.py output/thermal/components/silicon_die.vtu
+```
+
+On a build machine without a usable GPU, specify the intended compute
+architecture instead of `native`. A compatible GPU/driver with compute capability
+6.0+ is required to execute the double-precision CUDA solver. If device discovery
+fails, execution stops; no CPU fallback or fabricated temperature field is used.
+`uv run python/thermal.py --prepare-only` validates/prepares inputs without a GPU;
+`./build/thermal output/thermal` runs already-prepared inputs, followed by
+`uv run python/thermal.py --postprocess-only` to build visualization artifacts.
+
+Python reads current YAML material conductivities and mesh connectivity, orients
+exterior faces, constructs CSR **topology only**, and converts mm to meters.
+CUDA assembles conforming linear tetrahedral FEM stiffness matrices and uses
+Jacobi-preconditioned conjugate gradients in double precision. Shared interface
+nodes enforce temperature continuity and conservative assembled heat balance;
+cellwise gradients need not have identical pointwise face fluxes. Source powers
+are normalized by actual meshed region volume, then audited by integrating them.
+Steady state uses conductivity; density and heat capacity are retained for later
+transient work but do not enter this equation.
+
+All assumed losses, reference temperatures, temperature coefficients, still-air
+boundary coefficients, emissivities, the uncertain lumped PCB path and solver
+tolerances live under local `thermal:` YAML. Existing geometry/material entries
+are preserved. The operating point and on-resistances come from the existing
+electrical configuration. The user disabled control logic: auxiliary loss is
+zero, and nonzero auxiliary power is rejected until a real region is supplied.
+The fixed core-loss placeholder is unvalidated; other core-loss models currently
+raise an error rather than silently using a guessed Steinmetz law. No efficiency
+target is used: efficiency is output power divided by output power plus losses.
+
+Convection uses consistent triangle matrices; nonlinear gray radiation uses
+three-point triangle quadrature and secant-coefficient Picard iteration. The
+outer loop updates MOSFET/winding resistance from component volume-average
+temperatures. Temperatures, individual losses, nonlinear residual and overall
+energy balance must all converge. A temperature-domain guard and iteration
+limits stop invalid or unconverged runs. CUDA self-tests cover an analytic
+tetrahedron, integrated source loading, Robin assembly, PCG and boundary heat.
+
+Only exterior triangles exchange heat with ambient. Upward faces (including
+package ledges) use the top convection coefficient, vertical faces use the side
+coefficient, and downward faces use an explicitly configured bottom coefficient
+(initially zero). Radiation assumes a large ambient enclosure with unit view
+factor; mutual radiative occlusion is not modeled. Bottom pin contact faces use
+one total PCB conductance distributed by contact area; those faces have no
+additional air convection/radiation. An explicit PCB and the lumped PCB path
+cannot be enabled together. No liquid cooling is applied in this model.
+
+Ignored `output/thermal/` contains `history.tsv`, native `solution.json`,
+`temperature.bin`, `temperature.vtu`, individual component VTUs, `summary.png`,
+and `report.json` with component maximum/volume-average temperatures, loss
+breakdown, derived efficiency, heat-removal paths and energy error. Temperature
+is the viewer's default field; the **Slice only** checkbox interpolates it on
+the draggable plane. The report records the configuration/mesh hashes and
+assumptions. Nonconverged iterates are explicitly labeled and return exit code 2;
+initialization/errors return 1. `run_status.json` records failed CUDA execution
+without presenting a temperature prediction. Old result files are removed before
+a new native run.
+
+The geometry remains hypothetical, the winding is illustrative, and the current
+mesh has flagged skinny elements. No mesh-convergence or experimental validation
+has been established. Contact resistances, temperature-dependent material
+conductivity, saturation, AC winding physics and switching waveforms are not
+modeled. The specified lumped PCB path and fixed core loss are uncertain inputs,
+so even a converged numerical result is a preliminary model prediction.
 
 ## Volume meshing (no solver)
 
@@ -103,14 +179,14 @@ git init
 UV_CACHE_DIR=/tmp/pol-sim-uv-cache uv sync
 cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=native
 cmake --build build -j 2
-./build/thermal
+uv run python/thermal.py
 ./build/em
 ```
 
 For compilation without a working GPU driver, replace `native` with the compute
 architecture of the intended GPU (for example `75` for compute capability 7.5).
-This is a build target, not a device specification. Both executables initialize
-CUDA and print GPU 0's name and compute capability, or exit nonzero on failure.
+This is a build target, not a device specification. The thermal executable
+requires prepared inputs; both executables require an accessible CUDA device.
 
 The initialized workspace contains a confidential, ignored `config.yaml`. In a
 fresh clone, run `cp config.example.yaml config.yaml` and fill its null entries
@@ -147,14 +223,16 @@ UV_CACHE_DIR=/tmp/pol-sim-uv-cache uv run python python/geometry.py --no-view
 # View a saved model, including from another working directory:
 UV_CACHE_DIR=/tmp/pol-sim-uv-cache uv run python python/geometry.py --model data/module.json
 # CUDA programs read the shared geometry before initializing the GPU:
-./build/thermal --model data/module.geom
+# Thermal solver uses the mesh, not only geometry envelopes:
+uv run python/thermal.py
 ./build/em --model data/module.geom
 ```
 
 Default input/output paths are anchored to the repository, not the current working
 directory. Python tasks can read `data/module.json` directly with `json.load`.
 CUDA C++ tasks include `src/module_geometry.hpp` and call
-`load_module_geometry(path)`; both scaffold executables already support it.
+`load_module_geometry(path)`; the EM scaffold supports this reader. The thermal
+solver instead consumes the preprocessed volume mesh.
 The reader loads host-side arrays for later GPU upload; it does not solve physics.
 
 `module.json` contains geometry plus the complete footprint metadata.
@@ -225,7 +303,7 @@ parameters without changing the device configuration or canonical exports:
 uv run python/geometry.py --demo-winding
 uv run python/geometry.py --demo-winding --screenshot output/inductor-demo.png
 uv run python/visualize.py --model output/inductor-demo/module.json
-./build/thermal --model output/inductor-demo/module.geom
+uv run python/thermal.py
 ./build/em --model output/inductor-demo/module.geom
 ```
 
