@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from inductor import add_inductor_parts, demo_parameters
 from die import add_die
+from buck import add_buck_interconnects
 from pins import add_pins, prism_faces
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +62,7 @@ def build_model(config, footprint, demo_winding=False):
     if config.get('die'):
         add_die(model, config['die'])
     add_pins(model, g)
+    add_buck_interconnects(model)
     pins = model.get('pin_solids', [])
     overlaps = []
     for i,a in enumerate(pins):
@@ -92,7 +94,7 @@ def export_model(model, directory):
         lines.append('BOX ' + ' '.join(json.dumps(v) for v in
                      (b['name'], b.get('material') or 'unassigned', b.get('role', 'envelope'))) + ' ' +
                      ' '.join(map(str, b['min_mm']+b['max_mm'])))
-    for c in model.get('capsules', []):
+    for c in model.get('capsules', []) + model.get('interconnect_capsules', []):
         lines.append('CAPSULE ' + json.dumps(c['name']) + ' ' + json.dumps(c['material']) + ' ' +
                      ' '.join(map(str, c['a_mm']+c['b_mm']+[c['radius_mm']])))
     if model.get('composite_region'):
@@ -139,13 +141,16 @@ def plot_model(model, screenshot=None, backend=None):
     for body in model['bodies']:
         terminal = body['name'].startswith('terminal_')
         label = ('Silicon die' if body.get('material') == 'silicon' else
-                 'Terminals' if terminal else 'IC package' if body['name'] == 'ic_package' else 'Inductor')
-        color = 'slategray' if label == 'Silicon die' else '#b87333' if terminal else 'royalblue' if label == 'IC package' else 'dimgray'
-        opacity = .1 if body['name'] == 'inductor' and detailed else .65 if body.get('role') == 'solid' else .2
+                 'Cu-Clip '+body['net'] if body['name'].startswith('clip_') else 'FET contacts' if body['name'].startswith('contact_') else 'Terminals' if terminal else 'IC package' if body['name'] == 'ic_package' else 'Inductor')
+        color = 'slategray' if label == 'Silicon die' else '#b87333' if terminal or body['name'].startswith(('contact_','clip_')) else 'royalblue' if label == 'IC package' else 'dimgray'
+        opacity = 1 if body['name'].startswith('clip_') else .1 if body['name'] == 'inductor' and detailed else .65 if body.get('role') == 'solid' else .2
         add(plotter, groups, box(body['min_mm'], body['max_mm']), color, label, opacity)
     for wire in model.get('capsules', []):
         add(plotter, groups, capsule(wire['a_mm'], wire['b_mm'], wire['radius_mm']), '#b87333',
             'Copper leads' if wire['name'].startswith('lead_') else 'Copper winding')
+    for wire in model.get('interconnect_capsules', []):
+        color = {'VIN':'#548dd2','SW':'#db8b24','VOUT':'#702e9b','PGND':'#858585'}[wire['net']]
+        add(plotter, groups, capsule(wire['a_mm'],wire['b_mm'],wire['radius_mm']),color,'Buck '+wire['net'])
     for pin in model.get('pin_solids', []):
         add(plotter, groups, surface(prism_faces(pin)), '#b87333', 'Pads / pins')
     die = next((b for b in model['bodies'] if b['name'] == 'silicon_die'), None)

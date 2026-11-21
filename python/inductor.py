@@ -72,20 +72,21 @@ def add_inductor_parts(model, params, illustrative=False, terminal_material=None
     n = math.ceil(turns * segments)
     points = []
     for i in range(n + 1):
-        theta = math.pi + 2 * math.pi * turns * i / n
+        theta = -math.pi / 2 + 2 * math.pi * turns * i / n
         points.append(
             [r * math.cos(theta), r * math.sin(theta), bottom + height * i / n]
         )
+    # Rotate winding, leads and rectangular terminals together: terminal axis is Y.
     terminals, leads = [], []
     for index, point in enumerate((points[0], points[-1])):
-        theta = math.pi + index * 2 * math.pi * turns
+        theta = -math.pi / 2 + index * 2 * math.pi * turns
         cx, cy = outer * math.cos(theta), outer * math.sin(theta)
         terminal = dict(
             name=f"terminal_{index+1}",
             material=terminal_material or "terminal_metal",
             role="solid",
-            min_mm=[cx - size[0] / 2, cy - size[1] / 2, lo[2]],
-            max_mm=[cx + size[0] / 2, cy + size[1] / 2, lo[2] + size[2]],
+            min_mm=[cx - size[1] / 2, cy - size[0] / 2, lo[2]],
+            max_mm=[cx + size[1] / 2, cy + size[0] / 2, lo[2] + size[2]],
         )
         terminals.append(terminal)
         # Radial then vertical lead, ending inside its terminal for connectivity.
@@ -148,6 +149,7 @@ def add_inductor_parts(model, params, illustrative=False, terminal_material=None
         clearance_material=None,
     )
     model["inductor_detail"] = dict(
+        terminal_axis="y",
         parameters=params,
         illustrative=illustrative,
         terminal_material=terminal_material or "terminal_metal",

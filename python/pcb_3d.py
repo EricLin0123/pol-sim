@@ -85,7 +85,7 @@ def build_assembly(config, footprint):
                     'Rounded PCB pads approximated by polygons'],
                 unresolved=['Reference copper shapes overlap and may short nets; no validated netlist',
                     'Module pin/PCB land alignment and electrical connections',
-                    'Winding/lead-to-pin electrical connectivity; illustrative winding if unconfigured',
+                    'Copper clip dimensions and FET contact placement are assumed; external load/supply return geometry remains unspecified',
                     'Conformal assembly fragmentation and volume mesh',
                     'Frequency-dependent EM material properties, air domain, ports and boundaries'])
 
@@ -123,11 +123,14 @@ def view(model, output, show):
     mod=model['module_definition']
     for place in model['module_placements']:
         for body in mod['bodies']:
-            label='Module envelopes' if body['name'] in ('ic_package','inductor') else 'Die / terminals'
-            color='#50697b' if body['name']=='ic_package' else '#656565' if body['name']=='inductor' else '#b87333' if body.get('material')=='copper' else '#8a74ac'
+            label='Cu-Clip '+body['net'] if body['name'].startswith('clip_') else 'FET contacts' if body['name'].startswith('contact_') else 'Module envelopes' if body['name'] in ('ic_package','inductor') else 'Die / terminals'
+            color='#50697b' if body['name']=='ic_package' else '#656565' if body['name']=='inductor' else {'VIN':'#548dd2','SW':'#db8b24','VOUT':'#702e9b','PGND':'#858585'}.get(body.get('net'),'#b87333') if body.get('material')=='copper' else '#8a74ac'
             add([transform(f,place) for f in box_faces(body['min_mm'],body['max_mm'])],color,label,.14 if label=='Module envelopes' else .8)
         for pin in mod.get('pin_solids',[]): add([transform(f,place) for f in prism_faces(pin)],'#b87333','Module pins')
-        for wire in mod.get('capsules',[]): add([transform(f,place) for f in tube(wire['a_mm'],wire['b_mm'],wire['radius_mm'])],'#c88232','Winding')
+        for wire in mod.get('capsules',[]) + mod.get('interconnect_capsules',[]):
+            net=wire.get('net')
+            color={'VIN':'#548dd2','SW':'#db8b24','VOUT':'#702e9b','PGND':'#858585'}.get(net,'#c88232')
+            add([transform(f,place) for f in tube(wire['a_mm'],wire['b_mm'],wire['radius_mm'])],color,'Buck '+net if net else 'Winding')
     controls(plotter, groups, f"{len(model['module_placements'])}-module PCB assembly")
     output.mkdir(parents=True, exist_ok=True)
     if show:

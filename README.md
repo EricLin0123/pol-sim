@@ -473,12 +473,27 @@ several minutes. Region volume tags refer to the generating Gmsh session and
 must be remapped after CAD import. STEP/BREP preserve the volume geometry;
 `assembly.json` retains the source definitions and assumptions.
 
+The shared module now includes assumed buck power wiring: VIN to the high-side
+FET drain; its source to the switch node shared by the low-side FET drain and
+the -Y inductor terminal; the +Y inductor terminal to VOUT; and the low-side
+source to PGND. Separate copper contact pads and stamped copper clips (0.30 mm wide, 0.10 mm
+thick) represent
+these connections in the module preview, PCB assembly, and CAD generation.
+`buck_topology` records the connections, external supply/load ports, and separate
+high-side-on and low-side-on paths. FET channels remain silicon, not copper shorts.
+Contact placement and clip routing are illustrative assumptions; solder joints
+are ideal contacts without a separate solder volume. No power bond wires are
+used. Control/logic wiring remains unspecified. External load,
+supply, capacitor geometry, and return-current distributions remain undefined.
+The existing EM filament-loop source is unchanged and does not simulate this
+branched buck circuit; previous EM results do not validate the new geometry.
+
 These are preliminary assembly solids, not a conformal Maxwell mesh. The
 top copper follows the reference, with a continuous lower PGND pour joining the
 center PGND island and the four lower side pins (L6/L7/R6/R7). No bottom copper
 layer is added; the rectangular substrate outline comes from the illustration bounds.
 Traced copper overlaps are retained and may create shorts. Module land alignment,
-net connectivity and winding-to-pin connections remain unverified. Passive body
+physical net connectivity remains unverified despite the assumed internal buck wiring. Passive body
 markers are omitted because electrical terminal and body geometry are unknown.
 Repair/verify connectivity and fragment the entire assembly before volume meshing;
 then supply frequency-dependent EM materials, air domain, ports and boundaries.

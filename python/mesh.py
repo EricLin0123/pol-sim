@@ -83,6 +83,18 @@ def build_cad(model):
                 raise ValueError(f"Resolve active surface before meshing {source['name']}")
             continue
         add(source['name'],'silicon',[box(source)])
+    # Contact metal overrides its small overlap with the silicon active surface.
+    for contact in model['bodies']:
+        if contact['name'].startswith('contact_'):
+            add('buck_contacts_'+contact['net'],'copper',[box(contact)])
+    for net in ('VIN','SW','VOUT','PGND'):
+        clips=[box(b) for b in model['bodies'] if b['name'].startswith('clip_') and b['net']==net]
+        if clips:
+            add('buck_clip_'+net,'copper',fuse(clips))
+    for net in ('VIN','SW','VOUT','PGND'):
+        wires=[c for c in model.get('interconnect_capsules',[]) if c['net']==net]
+        if wires:
+            add('buck_interconnect_'+net,'copper',wire_union(wires))
     print('Fragmenting all volumes into conformal regions...',flush=True)
     inputs = [entry[2] for entry in entries]
     result,mapping = occ.fragment(inputs[:1],inputs[1:])
