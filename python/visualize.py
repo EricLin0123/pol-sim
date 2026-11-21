@@ -27,6 +27,7 @@ def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
     plotter = pv.Plotter(off_screen=off_screen,window_size=(1400,900))
     plotter.set_background('white')
     scalar = scalar or ('temperature_C' if 'temperature_C' in data.point_data else
+                        'temperature_difference_C' if 'temperature_difference_C' in data.point_data else
                         'region_id' if 'region_id' in data.cell_data else None)
     if series is not None and scalar not in ('temperature_C','temperature_K','mean_temperature_C','region_id','quality_minSICN'):
         raise ValueError('Time playback supports temperature and static mesh fields only')
@@ -38,6 +39,9 @@ def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
     actors, originals = {}, {}
     state = dict(cutaway=True,slice=False,edges=True,normal=(0,1,0),origin=data.center)
     clim = data.get_data_range(scalar) if scalar else None
+    if scalar=='temperature_difference_C':
+        extent=max(abs(clim[0]),abs(clim[1]),1e-12)
+        clim=(-extent,extent)
     if series is not None and scalar in ('temperature_C','temperature_K','mean_temperature_C'):
         offset=0 if scalar=='temperature_K' else 273.15
         clim=(float(temperatures.min()-offset),float(temperatures.max()-offset))
@@ -48,7 +52,7 @@ def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
         cut = grid.clip(normal=state['normal'],origin=state['origin'],invert=False,crinkle=True)
         # Some regions may be fully outside the initial plane. Keep their actors
         # alive so moving the plane can reveal them later.
-        actor = plotter.add_mesh(grid,scalars=scalar,clim=clim,cmap='tab10' if scalar=='region_id' else 'viridis',
+        actor = plotter.add_mesh(grid,scalars=scalar,clim=clim,cmap='tab10' if scalar=='region_id' else 'coolwarm' if scalar=='temperature_difference_C' else 'viridis',
             show_edges=True,edge_color='black',line_width=0.7,lighting=False,
             n_colors=len(ids) if scalar=='region_id' else 256,
             show_scalar_bar=bool(scalar and i==0),
@@ -90,7 +94,8 @@ def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
             border_size=1,color_on='#356b9a',color_off='lightgray')
         plotter.add_text(label,position=(44,y),font_size=10,color='black')
 
-    plotter.add_text('Temperature (C)' if scalar=='temperature_C' else 'Mesh display',position=(14,865),font_size=13,color='black')
+    title='Temperature (C)' if scalar=='temperature_C' else 'Liquid - air (C)' if scalar=='temperature_difference_C' else 'Mesh display'
+    plotter.add_text(title,position=(14,865),font_size=13,color='black')
     if scalar=='temperature_C' and report.get('converged') is False:
         plotter.add_text('PARTIAL TRANSIENT' if report.get('mode')=='transient' else 'NOT CONVERGED: diagnostic iterate',position=(450,865),font_size=12,color='red')
     checkbox('Element edges',set_edges,825)
@@ -204,6 +209,7 @@ def main():
     if args.scalar and args.scalar not in data.array_names:
         parser.error(f'Field not found: {args.scalar}')
     report_path = args.input.with_name('report.json')
+    if not report_path.is_file():report_path=args.input.with_name('comparison.json')
     report = json.loads(report_path.read_text()) if report_path.is_file() else None
     plotter = mesh_view(data,args.scalar,report,off_screen=bool(args.screenshot),series=series)
     if args.screenshot:

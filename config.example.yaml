@@ -79,4 +79,4 @@ simulation:
   time_step_s: null
   duration_s: null
 
-thermal: null # Local loss/cooling/CUDA settings and optional transient initial temperature, dt, duration, snapshot stride.
+thermal: null # Local loss/CUDA settings; cooling.mode air|liquid, cooling.liquid parameters, optional transient controls.

@@ -17,19 +17,24 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def prepare(config_path, mesh_dir, output, transient=False):
+def prepare(config_path, mesh_dir, output, transient=False, cooling_mode=None):
     config = yaml.safe_load(config_path.read_text())
     settings = config['thermal']
     losses, cooling, solver = (settings[k] for k in ('losses','cooling','solver'))
-    if cooling['mode'] != 'still_air':
-        raise ValueError('This initial boundary implementation requires still_air')
+    mode=cooling_mode or cooling['mode']
+    mode='air' if mode=='still_air' else mode
+    if mode not in ('air','liquid'):
+        raise ValueError('thermal.cooling.mode must be air or liquid')
+    liquid=cooling.get('liquid',{})
+    ambient=liquid['ambient_temperature_k'] if mode=='liquid' else cooling['ambient_temperature_k']
+    radiation=liquid.get('radiation_temperature_k',ambient) if mode=='liquid' else cooling['radiation_temperature_k']
     if losses['core_loss_model'] != 'fixed_placeholder':
         raise ValueError('Only the explicitly unvalidated fixed core-loss placeholder is implemented')
     if losses['auxiliary_ic_loss_w'] != 0:
         raise ValueError('Control logic has no region; auxiliary_ic_loss_w must remain zero')
     if losses['core_loss_validated']:
         raise ValueError('The fixed core-loss placeholder must be marked unvalidated')
-    if config['cooling']['method'] != 'still_air':
+    if mode=='air' and config['cooling']['method'] != 'still_air':
         raise ValueError('Legacy cooling.method conflicts with thermal.cooling.mode')
     report = json.loads((mesh_dir/'report.json').read_text())
     mesh = np.load(mesh_dir/'module.npz',allow_pickle=False)
@@ -96,14 +101,34 @@ def prepare(config_path, mesh_dir, output, transient=False):
         contact = (regions[owner]==names['copper_pins']) & (nz<-.5) & np.isclose(p.mean(axis=1)[:,2],points[:,2].min(),atol=1e-10)
         contact_area = float(area[contact].sum())
         resistance = cooling['pcb_pin_path_k_w']
-        if not contact_area or resistance<=0:
+        if not contact_area or not np.isfinite(resistance) or resistance<=0:
             raise ValueError('Missing bottom pin contacts or invalid lumped PCB resistance')
         pcb[contact] = 1/(resistance*contact_area)
         h[contact] = 0
         epsilon[contact] = 0
     else:
         contact_area = 0
-    if np.any(h<0) or np.any(epsilon<0) or np.any(epsilon>1):
+    # The mesh already labels the inductor top separately from the IC ledges.
+    top_ids=[int(i) for i,b in report['boundaries'].items() if b['name']=='top_cooling_candidate']
+    top=np.isin(mesh['boundary_id'],top_ids)
+    geometric_top=np.all(np.isclose(p[:,:,2],points[:,2].max(),atol=1e-10),axis=1)&(nz>.99)
+    if not np.array_equal(top,geometric_top) or not np.any(top):
+        raise ValueError('Mesh top-surface tag does not match the inductor top plane')
+    liquid_h=np.zeros(len(boundary),dtype='<f8')
+    coolant=np.full(len(boundary),ambient,dtype='<f8')
+    if mode=='liquid':
+        expected=liquid['contact_area_mm2']*1e-6
+        actual=float(area[top].sum())
+        if not np.isfinite(expected) or expected<=0 or not np.isclose(actual,expected,rtol=1e-6,atol=1e-12):
+            raise ValueError(f'Liquid contact area mismatch: mesh {actual*1e6:g} vs config {expected*1e6:g} mm2')
+        coefficient=liquid['heat_transfer_coefficient_w_m2_k']
+        if not np.isfinite(coefficient) or coefficient<=0 or not np.isfinite(liquid['coolant_temperature_k']) or liquid['coolant_temperature_k']<=0:
+            raise ValueError('Invalid liquid coefficient or absolute coolant temperature')
+        h[:]=liquid['other_convection_w_m2_k']
+        h[contact]=0 # Existing lumped PCB path remains the only pin-contact sink.
+        h[top]=0;epsilon[top]=0 # Cooler-covered face has no additional air/radiation path.
+        liquid_h[top]=coefficient;coolant[top]=liquid['coolant_temperature_k']
+    if not np.all(np.isfinite(h)) or not np.all(np.isfinite(epsilon)) or np.any(h<0) or np.any(epsilon<0) or np.any(epsilon>1):
         raise ValueError('Invalid convection coefficient or emissivity')
     # CSR connectivity contains no numerical stiffness matrix: CUDA assembles it.
     row = np.repeat(tet,4,axis=1).ravel()
@@ -131,13 +156,13 @@ def prepare(config_path, mesh_dir, output, transient=False):
         dead_transitions=losses['dead_time_transitions_per_cycle'],diode_v=losses['body_diode_drop_v'],
         dcr_reference=losses['winding_dcr_reference_ohm'],copper_alpha=losses['copper_resistance_temperature_coefficient_per_k'],
         ac_loss_w=losses['winding_ac_loss_w'],core_loss_w=losses['core_loss_w'],auxiliary_w=losses['auxiliary_ic_loss_w'],
-        ambient_k=cooling['ambient_temperature_k'],radiation_k=cooling['radiation_temperature_k'],
+        ambient_k=ambient,radiation_k=radiation,liquid_mode=int(mode=='liquid'),
         hs_region=names['high_side_fet'],ls_region=names['low_side_fet'],winding_region=names['copper_winding'],core_region=names['metal_composite'])
     parameters.update(solver)
     temporal=settings.get('transient',{})
     parameters.update(transient=int(transient),time_step_s=temporal.get('time_step_s',0.1),
         duration_s=temporal.get('duration_s',60.0),snapshot_stride=temporal.get('snapshot_stride',5),
-        initial_temperature_k=temporal.get('initial_temperature_k',cooling['ambient_temperature_k']))
+        initial_temperature_k=temporal.get('initial_temperature_k',ambient))
     if min(parameters[k] for k in ('time_step_s','duration_s','initial_temperature_k'))<=0 or parameters['snapshot_stride']<1 or int(parameters['snapshot_stride'])!=parameters['snapshot_stride']:
         raise ValueError('Invalid transient time step, duration, initial temperature, or snapshot stride')
     if parameters['initial_temperature_k']>solver['maximum_temperature_k']:
@@ -165,17 +190,26 @@ def prepare(config_path, mesh_dir, output, transient=False):
         raise ValueError('Mesh exceeds int32 connectivity support')
     output.mkdir(parents=True,exist_ok=True)
     with (output/'input.bin').open('wb') as f:
-        f.write(b'POLTHM02')
+        f.write(b'POLTHM03')
         f.write(struct.pack('<5i',len(points),len(tet),len(boundary),int(regions.max())+1,csr.nnz))
-        for array in (points,tet,regions,conductivity,boundary,h,epsilon,pcb,tet_slots,face_slots,rowptr,columns,heat_capacity):
+        for array in (points,tet,regions,conductivity,boundary,h,epsilon,pcb,tet_slots,face_slots,rowptr,columns,heat_capacity,
+                      liquid_h,coolant,top.astype('<i4')):
             f.write(np.ascontiguousarray(array).tobytes())
+    np.savez_compressed(output/'boundary_conditions.npz',triangles=boundary,area_m2=area,top_mask=top,
+        air_h_w_m2_k=h,liquid_h_w_m2_k=liquid_h,coolant_temperature_k=coolant,emissivity=epsilon,pcb_h_w_m2_k=pcb)
     (output/'parameters.txt').write_text(''.join(f'{k} {v:.17g}\n' for k,v in parameters.items()))
     record = dict(mesh_dir=str(mesh_dir.resolve()),config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
         mesh_sha256=hashlib.sha256((mesh_dir/'module.npz').read_bytes()).hexdigest(),regions=report['regions'],boundaries=report['boundaries'],
         assumptions=settings,pcb_contact_area_m2=contact_area,pcb_conductance_w_k=float(np.dot(pcb,area)),
         radiation_excluded_on_pcb_contact=True,control_logic_heat_source=False,auxiliary_loss_w=0,
         mesh_quality=report.get('quality_status'),illustrative_winding=report.get('illustrative_winding'),
-        mode='transient' if transient else 'steady_state',
+        mode='transient' if transient else 'steady_state',cooling_mode=mode,
+        top_contact_area_m2=float(area[top].sum()),
+        liquid_contact_conductance_w_k=float(np.dot(liquid_h,area)),
+        liquid_settings=liquid if mode=='liquid' else None,
+        top_design_target_k=liquid.get('target_top_temperature_k'),
+        electrical_parameters={k:parameters[k] for k in ('vin','vout','iout','fsw','inductance','rhs_reference','rls_reference',
+            'reference_k','mosfet_alpha','rise_s','fall_s','dead_s','dead_transitions','diode_v','dcr_reference','copper_alpha','ac_loss_w','core_loss_w','auxiliary_w')},
         time_parameters={k:parameters[k] for k in ('time_step_s','duration_s','snapshot_stride','initial_temperature_k')},
         method='conforming P1 tetrahedral FEM; consistent Robin matrices; three-point triangle radiation quadrature',
         time_discretization='backward Euler with lumped nodal heat capacity' if transient else None)
@@ -255,6 +289,16 @@ def postprocess(directory):
         maximum_c=float(temperature[np.unique(cells[mask])].max()-273.15),
         volume_average_c=float(np.average(mean[mask],weights=volumes[mask])-273.15))
     result.update(components=stats,input=record)
+    result['cooling_mode']=record.get('cooling_mode','air')
+    if result.get('top_surface_average_k') is not None:
+        result['top_surface']=dict(area_mm2=result['top_surface_area_m2']*1e6,
+            average_temperature_c=result['top_surface_average_k']-273.15,
+            maximum_temperature_c=result['top_surface_maximum_k']-273.15)
+        target=record.get('top_design_target_k')
+        if target is not None:
+            result['top_surface'].update(design_target_c=target-273.15,
+                maximum_minus_target_k=result['top_surface_maximum_k']-target,
+                design_target_imposed_as_boundary=False)
     hotspot=int(np.argmax(temperature))
     result['global_maximum_temperature_c']=float(temperature[hotspot]-273.15)
     result['global_hotspot_position_mm']=mesh.points[hotspot].tolist()
@@ -273,7 +317,10 @@ def postprocess(directory):
     axes[0,0].set_xticks(x,named,rotation=20);axes[0,0].set_ylabel('Temperature (C)');axes[0,0].legend()
     axes[0,1].bar(result['losses_w'].keys(),result['losses_w'].values());axes[0,1].tick_params(axis='x',rotation=45)
     axes[0,1].set_ylabel('Loss (W)')
-    axes[1,0].bar(['Convection','Radiation','PCB'],[result[k] for k in ('convection_w','radiation_w','pcb_w')]);axes[1,0].set_ylabel('Heat out (W)')
+    paths=['Convection','Radiation','PCB'];removed=[result[k] for k in ('convection_w','radiation_w','pcb_w')]
+    if record.get('cooling_mode')=='liquid':
+        paths.append('Liquid');removed.append(result['liquid_cooling_w'])
+    axes[1,0].bar(paths,removed);axes[1,0].set_ylabel('Heat out (W)')
     history=np.genfromtxt(directory/'history.tsv',names=True,delimiter='\t',ndmin=1)
     if series is None:
         for key in ('nonlinear_relative_residual','energy_relative_error'):
@@ -290,37 +337,104 @@ def postprocess(directory):
     print('Wrote temperature.vtu, component maps, and report.json; converged =',result['converged'])
 
 
+def execute(config_path,mesh_dir,output,solver,transient=False,cooling_mode=None,prepare_only=False):
+    record=prepare(config_path,mesh_dir,output,transient,cooling_mode)
+    if prepare_only:return 0
+    # Remove stale outputs so a failed GPU run cannot look like new results.
+    for name in ('solution.json','temperature.bin','report.json','temperature.vtu','history.tsv','summary.png',
+                 'transient_times.txt','transient_temperature.bin','temperature_series.npz','component_time_history.npz','time_history.tsv'):
+        (output/name).unlink(missing_ok=True)
+    if (output/'components').is_dir():
+        for old in (output/'components').glob('*.vtu'):old.unlink()
+        (output/'components'/'report.json').unlink(missing_ok=True)
+    run=subprocess.run([str(solver.resolve()),str(output.resolve())],check=False)
+    status=dict(exit_code=run.returncode,solution_available=(output/'solution.json').exists(),
+                status='completed' if run.returncode==0 else 'not_converged' if run.returncode==2 else 'cuda_execution_failed',
+                numerical_solution_converged=False,cooling_mode=record['cooling_mode'])
+    if status['solution_available']:
+        status['numerical_solution_converged']=bool(json.loads((output/'solution.json').read_text())['converged'])
+    (output/'run_status.json').write_text(json.dumps(status,indent=2)+'\n')
+    if (output/'solution.json').exists():postprocess(output)
+    return run.returncode
+
+
+def compare_results(directory):
+    """Compare only converged steady-state GPU outputs with identical mesh/electrical input."""
+    records={m:json.loads((directory/m/'input.json').read_text()) for m in ('air','liquid')}
+    if any(records['air'][k]!=records['liquid'][k] for k in ('config_sha256','mesh_sha256','electrical_parameters','mode')) or records['air']['mode']!='steady_state':
+        raise ValueError('Comparison requires identical mesh, operating/loss parameters and steady-state mode')
+    summary=dict(identical_operating_conditions=True,regions=records['air']['regions'],
+        modes={m:json.loads((directory/m/'run_status.json').read_text()) for m in records})
+    for name in ('temperature_comparison.png','temperature_difference.vtu'):
+        (directory/name).unlink(missing_ok=True)
+    if not all(s['numerical_solution_converged'] for s in summary['modes'].values()):
+        summary.update(status='unavailable',reason='Both CUDA runs must converge before temperature comparison is generated')
+        (directory/'comparison.json').write_text(json.dumps(summary,indent=2)+'\n')
+        print('Temperature comparison unavailable: one or both CUDA runs did not produce a converged solution.')
+        return False
+    reports={m:json.loads((directory/m/'report.json').read_text()) for m in records}
+    for m,r in reports.items():
+        if not r['converged'] or r.get('mode')!='steady_state' or r.get('cooling_mode')!=m:
+            raise ValueError('Comparison report is not a converged steady-state case for the requested cooling mode')
+        if any(r['input'][k]!=records[m][k] for k in ('config_sha256','mesh_sha256','electrical_parameters')):
+            raise ValueError('Comparison output is stale relative to its prepared inputs')
+    import pyvista as pv
+    air=pv.read(directory/'air'/'temperature.vtu');liquid=pv.read(directory/'liquid'/'temperature.vtu')
+    if not np.array_equal(air.points,liquid.points) or not np.array_equal(air.cells,liquid.cells):
+        raise ValueError('Temperature comparison meshes do not match')
+    difference=air.copy();difference.point_data.clear()
+    for key in ('mean_temperature_C','heat_generation_W_m3'):
+        if key in difference.cell_data:del difference.cell_data[key]
+    difference.point_data['temperature_difference_C']=liquid.point_data['temperature_C']-air.point_data['temperature_C']
+    difference.save(directory/'temperature_difference.vtu')
+    summary.update(status='completed',results={m:{k:r[k] for k in ('top_surface','components','total_loss_w','efficiency','convection_w','radiation_w','pcb_w','liquid_cooling_w','energy_balance_relative_error')} for m,r in reports.items()})
+    (directory/'comparison.json').write_text(json.dumps(summary,indent=2)+'\n')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    names=['Top surface','Silicon die','High-side FET','Low-side FET','Winding','Composite']
+    parts=['silicon_die','high_side_fet','low_side_fet','copper_winding','metal_composite']
+    fig,axes=plt.subplots(2,1,figsize=(11,8),layout='constrained')
+    x=np.arange(len(names))
+    for ax,stat,topkey in zip(axes,('volume_average_c','maximum_c'),('average_temperature_c','maximum_temperature_c')):
+        for m,offset in (('air',-.18),('liquid',.18)):
+            values=[reports[m]['top_surface'][topkey]]+[reports[m]['components'][n][stat] for n in parts]
+            ax.bar(x+offset,values,width=.36,label=m)
+        target=reports['liquid']['top_surface'].get('design_target_c')
+        if target is not None:ax.plot([-.4,.4],[target,target],'r--',label='Top target (not a BC)')
+        ax.set_xticks(x,names);ax.set_ylabel(('Average' if stat=='volume_average_c' else 'Maximum')+' temperature (C)');ax.legend()
+    fig.suptitle('Converged CUDA cooling comparison — identical electrical operating conditions')
+    fig.savefig(directory/'temperature_comparison.png',dpi=160);plt.close(fig)
+    return True
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,default=ROOT/'config.yaml')
     p.add_argument('--mesh-dir',type=Path,default=ROOT/'output'/'mesh')
     p.add_argument('--output-dir',type=Path)
     p.add_argument('--transient',action='store_true',help='Solve physical time evolution with CUDA, not nonlinear-iteration playback')
+    p.add_argument('--cooling',choices=('air','liquid'),help='Override thermal.cooling.mode without editing the air settings')
+    p.add_argument('--compare',action='store_true',help='Run identical steady-state cases for both cooling modes and compare converged outputs')
     p.add_argument('--solver',type=Path,default=ROOT/'build'/'thermal')
     p.add_argument('--prepare-only',action='store_true')
     p.add_argument('--postprocess-only',action='store_true')
     a=p.parse_args()
-    a.output_dir=a.output_dir or ROOT/'output'/('thermal_transient' if a.transient else 'thermal')
+    selected=a.cooling or yaml.safe_load(a.config.read_text())['thermal']['cooling']['mode']
+    selected='air' if selected=='still_air' else selected
+    if a.compare:
+        if a.transient or a.postprocess_only or a.cooling:
+            p.error('--compare runs both steady-state modes; do not combine it with --transient, --postprocess-only or --cooling')
+        folder=a.output_dir or ROOT/'output'/'cooling_comparison'
+        codes=[execute(a.config,a.mesh_dir,folder/m,a.solver,False,m,a.prepare_only) for m in ('air','liquid')]
+        if not a.prepare_only and not compare_results(folder):raise SystemExit(max(1,*codes))
+        return
+    default='thermal'+('_liquid' if selected=='liquid' else '')+('_transient' if a.transient else '')
+    a.output_dir=a.output_dir or ROOT/'output'/default
     if a.postprocess_only:
         postprocess(a.output_dir);return
-    prepare(a.config,a.mesh_dir,a.output_dir,a.transient)
-    if a.prepare_only:return
-    # Remove stale outputs so a failed GPU run cannot look like new results.
-    for name in ('solution.json','temperature.bin','report.json','temperature.vtu','history.tsv','summary.png',
-                 'transient_times.txt','transient_temperature.bin','temperature_series.npz','component_time_history.npz','time_history.tsv'):
-        (a.output_dir/name).unlink(missing_ok=True)
-    if (a.output_dir/'components').is_dir():
-        for old in (a.output_dir/'components').glob('*.vtu'):old.unlink()
-        (a.output_dir/'components'/'report.json').unlink(missing_ok=True)
-    run=subprocess.run([str(a.solver.resolve()),str(a.output_dir.resolve())],check=False)
-    status=dict(exit_code=run.returncode,solution_available=(a.output_dir/'solution.json').exists(),
-                status='completed' if run.returncode==0 else 'not_converged' if run.returncode==2 else 'cuda_execution_failed',
-                numerical_solution_converged=False)
-    if status['solution_available']:
-        status['numerical_solution_converged']=bool(json.loads((a.output_dir/'solution.json').read_text())['converged'])
-    (a.output_dir/'run_status.json').write_text(json.dumps(status,indent=2)+'\n')
-    if (a.output_dir/'solution.json').exists():postprocess(a.output_dir)
-    if run.returncode:raise SystemExit(run.returncode)
+    code=execute(a.config,a.mesh_dir,a.output_dir,a.solver,a.transient,selected,a.prepare_only)
+    if code:raise SystemExit(code)
 
 
 if __name__=='__main__':main()

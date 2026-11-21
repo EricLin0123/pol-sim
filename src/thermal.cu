@@ -50,13 +50,13 @@ std::vector<T> read_array(std::ifstream &f, size_t n)
 struct Input
 {
     int n, nt, nf, nr, nnz;
-    std::vector<double> xyz, k, h, eps, pcb, rho_cp;
-    std::vector<int> tet, region, face, tslot, fslot, row, col;
+    std::vector<double> xyz, k, h, eps, pcb, rho_cp, liquid_h, coolant;
+    std::vector<int> tet, region, face, tslot, fslot, row, col, top;
     explicit Input(const fs::path &path)
     {
         std::ifstream f(path, std::ios::binary);
         char magic[8];
-        if (!f.read(magic, 8) || (std::string(magic, 8) != "POLTHM01" && std::string(magic,8) != "POLTHM02"))
+        if (!f.read(magic, 8) || (std::string(magic, 8) != "POLTHM01" && std::string(magic,8) != "POLTHM02" && std::string(magic,8) != "POLTHM03"))
             throw std::runtime_error("Invalid thermal input header");
         auto counts = read_array<int>(f, 5);
         n = counts[0];
@@ -78,7 +78,11 @@ struct Input
         fslot = read_array<int>(f, size_t(nf) * 9);
         row = read_array<int>(f, n + 1);
         col = read_array<int>(f, nnz);
-        rho_cp = std::string(magic,8)=="POLTHM02" ? read_array<double>(f,nt) : std::vector<double>(nt,0);
+        rho_cp = std::string(magic,8)!="POLTHM01" ? read_array<double>(f,nt) : std::vector<double>(nt,0);
+        bool v3=std::string(magic,8)=="POLTHM03";
+        liquid_h=v3?read_array<double>(f,nf):std::vector<double>(nf,0);
+        coolant=v3?read_array<double>(f,nf):std::vector<double>(nf,0);
+        top=v3?read_array<int>(f,nf):std::vector<int>(nf,0);
         for (int i : tet)
             if (i < 0 || i >= n)
                 throw std::runtime_error("Invalid tetrahedron node");
@@ -250,12 +254,14 @@ __device__ double face_area(const double *xyz, const int *face, int e)
 // Three-point degree-two triangle quadrature: each weight is A/3.
 __device__ double shape(int q, int i) { return q == i ? 2.0 / 3 : 1.0 / 6; }
 __global__ void boundary_matrix(int nf, const int *face, const int *slots, const double *xyz, const double *h, const double *eps, const double *pcb,
-                                const double *theta, double ambient, double trad, double *matrix, double *rhs)
+                                const double *theta, double ambient, double trad, double *matrix, double *rhs,
+                                const double *liquid_h=nullptr,const double *coolant=nullptr)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= nf)
         return;
     double area = face_area(xyz, face, e), sigma = 5.670374419e-8;
+    double hl=liquid_h?liquid_h[e]:0,tc=coolant?coolant[e]:ambient;
     for (int q = 0; q < 3; ++q)
     {
         double t = ambient;
@@ -264,19 +270,20 @@ __global__ void boundary_matrix(int nf, const int *face, const int *slots, const
         double hr = eps[e] * sigma * (t + trad) * (t * t + trad * trad);
         for (int i = 0; i < 3; ++i)
         {
-            atomicAdd(rhs + face[3 * e + i], area / 3 * shape(q, i) * hr * (trad - ambient));
+            atomicAdd(rhs + face[3 * e + i], area / 3 * shape(q, i) * (hr * (trad - ambient)+hl*(tc-ambient)));
             for (int j = 0; j < 3; ++j)
-                atomicAdd(matrix + slots[9 * e + 3 * i + j], area / 3 * shape(q, i) * shape(q, j) * (h[e] + pcb[e] + hr));
+                atomicAdd(matrix + slots[9 * e + 3 * i + j], area / 3 * shape(q, i) * shape(q, j) * (h[e] + pcb[e] + hr+hl));
         }
     }
 }
 __global__ void heat_flow(int nf, const int *face, const double *xyz, const double *h, const double *eps, const double *pcb,
-                          const double *theta, double ambient, double trad, double *flow)
+                          const double *theta, double ambient, double trad, double *flow,
+                          const double *liquid_h=nullptr,const double *coolant=nullptr)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= nf)
         return;
-    double area = face_area(xyz, face, e), conv = 0, rad = 0, board = 0;
+    double area = face_area(xyz, face, e), conv = 0, rad = 0, board = 0,liquid=0;
     for (int q = 0; q < 3; ++q)
     {
         double rise = 0;
@@ -286,10 +293,18 @@ __global__ void heat_flow(int nf, const int *face, const double *xyz, const doub
         conv += area / 3 * h[e] * rise;
         board += area / 3 * pcb[e] * rise;
         rad += area / 3 * eps[e] * 5.670374419e-8 * (t * t * t * t - trad * trad * trad * trad);
+        if(liquid_h)liquid+=area/3*liquid_h[e]*(t-(coolant?coolant[e]:ambient));
     }
     atomicAdd(flow, conv);
     atomicAdd(flow + 1, rad);
     atomicAdd(flow + 2, board);
+    if(liquid_h)atomicAdd(flow+3,liquid);
+}
+__global__ void top_surface_stats(int nf,const int* face,const int* top,const double* xyz,const double* theta,double ambient,double* stats) {
+    int e=blockIdx.x*blockDim.x+threadIdx.x;if(e>=nf||!top[e])return;
+    double area=face_area(xyz,face,e),mean=0;
+    for(int i=0;i<3;++i) { double t=theta[face[3*e+i]]+ambient;mean+=t/3;maximum(stats+2,t); }
+    atomicAdd(stats,area);atomicAdd(stats+1,area*mean);
 }
 __global__ void spmv(int n, const int *row, const int *col, const double *a, const double *x, double *y)
 {
@@ -521,6 +536,22 @@ void self_test()
     double radiation = .5 * 5.670374419e-8 * area * (std::pow(320., 4) - std::pow(300., 4));
     if (std::abs(out[0] - 2 * area * 20) > 1e-10 || std::abs(out[1] - radiation) > 1e-10 || std::abs(out[2] - 3 * area * 20) > 1e-10)
         throw std::runtime_error("Self-test: boundary energy quadrature failed");
+    // Distinct coolant and ambient temperatures test the Robin load offset.
+    Device<double> hl(1),tc(1),liquid_flow(4),robin(16),robin_rhs(4),surface(3);Device<int> top(1);
+    hl.upload({7});tc.upload({280});h.zero();eps.zero();pcb.zero();robin.zero();robin_rhs.zero();top.upload({1});
+    boundary_matrix<<<1,256>>>(1,face.p,fslots.p,xyz.p,h.p,eps.p,pcb.p,theta.p,300,300,robin.p,robin_rhs.p,hl.p,tc.p);
+    auto rm=robin.download(),rb=robin_rhs.download();
+    for(int i=0;i<4;++i) {
+        if(std::abs(rb[i]-(i?7*area/3*(280-300):0))>1e-11)throw std::runtime_error("Self-test: liquid Robin load failed");
+        for(int j=0;j<4;++j)if(std::abs(rm[4*i+j]-((i&&j)?7*area/12*(i==j?2:1):0))>1e-12)
+            throw std::runtime_error("Self-test: liquid Robin matrix failed");
+    }
+    liquid_flow.zero();heat_flow<<<1,256>>>(1,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,300,300,liquid_flow.p,hl.p,tc.p);
+    auto lf=liquid_flow.download();if(std::abs(lf[3]-7*area*(320-280))>1e-10||lf[0]!=0||lf[1]!=0||lf[2]!=0)
+        throw std::runtime_error("Self-test: separate liquid heat accounting failed");
+    surface.zero();top_surface_stats<<<1,256>>>(1,face.p,top.p,xyz.p,theta.p,300,surface.p);
+    auto st=surface.download();if(std::abs(st[0]-area)>1e-12||std::abs(st[1]/st[0]-320)>1e-10||st[2]!=320)
+        throw std::runtime_error("Self-test: top temperature statistics failed");
     // Adiabatic uniform heating: C_total=1 J/K, P=2 W, dt=.5 s -> +1 K.
     Device<double> rc(1),capacity(4),old(4),stored(1);
     rc.upload({6});capacity.zero();
@@ -570,10 +601,12 @@ int run(const fs::path &directory)
     h.upload(in.h);
     eps.upload(in.eps);
     pcb.upload(in.pcb);
+    Device<double> liquid_h(in.nf),coolant(in.nf);Device<int> top(in.nf);
+    liquid_h.upload(in.liquid_h);coolant.upload(in.coolant);top.upload(in.top);
     Device<double> capacity(in.n),rho_cp(in.nt),old_time(in.n),storage(1);
     capacity.zero();rho_cp.upload(in.rho_cp);
     double active_dt=0;
-    Device<double> base(in.nnz), a(in.nnz), rhs(in.n), volume(in.nt), rv(in.nr), theta(in.n), candidate(in.n), integral(in.nr), maxt(in.nr), negmin(in.nr), mean(in.nr), power(in.nr), loss(9), flow(3), delta(1), kelvin(in.n);
+    Device<double> base(in.nnz), a(in.nnz), rhs(in.n), volume(in.nt), rv(in.nr), theta(in.n), candidate(in.n), integral(in.nr), maxt(in.nr), negmin(in.nr), mean(in.nr), power(in.nr), loss(9), flow(4), delta(1), kelvin(in.n);
     base.zero();
     rv.zero();
     theta.zero();
@@ -594,25 +627,25 @@ int run(const fs::path &directory)
     auto update_losses = [&]()
     {losses<<<1,1>>>(c,mean.p,power.p,loss.p,invalid.p);if(invalid.download()[0])throw std::runtime_error("Temperature-dependent resistance outside model domain"); };
     auto assemble = [&]()
-    {check(cudaMemcpy(a.p,base.p,in.nnz*sizeof(double),cudaMemcpyDeviceToDevice));rhs.zero();source<<<blocks(in.nt),256>>>(in.nt,tet.p,region.p,volume.p,rv.p,power.p,rhs.p);boundary_matrix<<<blocks(in.nf),256>>>(in.nf,face.p,fslot.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,a.p,rhs.p);if(active_dt>0)time_matrix<<<blocks(in.n),256>>>(in.n,row.p,col.p,capacity.p,old_time.p,active_dt,a.p,rhs.p);check(cudaGetLastError()); };
+    {check(cudaMemcpy(a.p,base.p,in.nnz*sizeof(double),cudaMemcpyDeviceToDevice));rhs.zero();source<<<blocks(in.nt),256>>>(in.nt,tet.p,region.p,volume.p,rv.p,power.p,rhs.p);boundary_matrix<<<blocks(in.nf),256>>>(in.nf,face.p,fslot.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,a.p,rhs.p,liquid_h.p,coolant.p);if(active_dt>0)time_matrix<<<blocks(in.n),256>>>(in.n,row.p,col.p,capacity.p,old_time.p,active_dt,a.p,rhs.p);check(cudaGetLastError()); };
     stats();
     update_losses();
     PCG pcg(in.n);
     std::ofstream history(directory / "history.tsv");
-    history << std::setprecision(17) << "time_s\tstep\touter\tpcg_iterations\tlinear_relative_residual\tnonlinear_relative_residual\tmax_change_K\tmax_loss_change_W\tpower_W\tconvection_W\tradiation_W\tpcb_W\tstorage_W\tenergy_relative_error\n";
+    history << std::setprecision(17) << "time_s\tstep\touter\tpcg_iterations\tlinear_relative_residual\tnonlinear_relative_residual\tmax_change_K\tmax_loss_change_W\tpower_W\tconvection_W\tradiation_W\tpcb_W\tliquid_W\tstorage_W\tenergy_relative_error\n";
     bool converged=false;
     std::string reason="maximum_outer_iterations";
     int outer=0,step=0,total_outer=0;
     PCGResult linear{0,0,false};
     double nonlinear=0,change=0,loss_change=0,energy=0,stored=0,time=0,last_snapshot=-1;
-    auto components=loss.download();std::vector<double> flows(3);
+    auto components=loss.download();std::vector<double> flows(4);
     double accepted_stored=0,accepted_energy=1;
     std::ofstream frame_times,frame_data,time_history;
     if(transient) {
         frame_times.open(directory/"transient_times.txt");frame_times<<std::setprecision(17);
         frame_data.open(directory/"transient_temperature.bin",std::ios::binary);
         time_history.open(directory/"time_history.tsv");
-        time_history<<std::setprecision(17)<<"time_s\tstep\tinner_iterations\tmaximum_temperature_K\tpower_W\tconvection_W\tradiation_W\tpcb_W\tstorage_W\tenergy_relative_error\n";
+        time_history<<std::setprecision(17)<<"time_s\tstep\tinner_iterations\tmaximum_temperature_K\tpower_W\tconvection_W\tradiation_W\tpcb_W\tliquid_W\tstorage_W\tenergy_relative_error\n";
     }
     auto snapshot=[&](double t) {
         absolute_temperature<<<blocks(in.n),256>>>(in.n,theta.p,c.ambient,kelvin.p);
@@ -638,13 +671,13 @@ int run(const fs::path &directory)
             if(invalid.download()[0])throw std::runtime_error("Temperature limit/nonfinite state: no validated thermal solution");
             change=delta.download()[0];stats();update_losses();components=loss.download();loss_change=0;
             for(int j=0;j<8;++j)loss_change=std::max(loss_change,std::abs(components[j]-previous[j]));
-            flow.zero();heat_flow<<<blocks(in.nf),256>>>(in.nf,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,flow.p);
+            flow.zero();heat_flow<<<blocks(in.nf),256>>>(in.nf,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,flow.p,liquid_h.p,coolant.p);
             flows=flow.download();stored=0;
             if(transient) {
                 storage.zero();stored_heat_rate<<<blocks(in.n),256>>>(in.n,capacity.p,theta.p,old_time.p,active_dt,storage.p);
                 stored=storage.download()[0];
             }
-            energy=std::abs(components[8]-flows[0]-flows[1]-flows[2]-stored)/std::max(components[8],1e-30);
+            energy=std::abs(components[8]-flows[0]-flows[1]-flows[2]-flows[3]-stored)/std::max(components[8],1e-30);
             assemble();spmv<<<blocks(in.n),256>>>(in.n,row.p,col.p,a.p,theta.p,pcg.ap.p);
             residual<<<blocks(in.n),256>>>(in.n,rhs.p,pcg.ap.p,pcg.r.p);
             // Scale residual by physical source/boundary power, not the potentially
@@ -655,7 +688,7 @@ int run(const fs::path &directory)
                 rhs_scale=std::max(components[8]/std::sqrt(double(in.n)),1e-30);
             } else rhs_scale=std::max(sqrt(pcg.dot(rhs.p,rhs.p)),1e-30);
             nonlinear=sqrt(pcg.dot(pcg.r.p,pcg.r.p))/rhs_scale;
-            history<<target<<'\t'<<step<<'\t'<<outer<<'\t'<<linear.iterations<<'\t'<<linear.relative_residual<<'\t'<<nonlinear<<'\t'<<change<<'\t'<<loss_change<<'\t'<<components[8]<<'\t'<<flows[0]<<'\t'<<flows[1]<<'\t'<<flows[2]<<'\t'<<stored<<'\t'<<energy<<'\n';history.flush();
+            history<<target<<'\t'<<step<<'\t'<<outer<<'\t'<<linear.iterations<<'\t'<<linear.relative_residual<<'\t'<<nonlinear<<'\t'<<change<<'\t'<<loss_change<<'\t'<<components[8]<<'\t'<<flows[0]<<'\t'<<flows[1]<<'\t'<<flows[2]<<'\t'<<flows[3]<<'\t'<<stored<<'\t'<<energy<<'\n';history.flush();
             if(!linear.converged){reason="linear_solver_did_not_converge";break;}
             if(change<=value("temperature_tolerance_k")&&loss_change<=value("loss_tolerance_w")&&energy<=value("energy_relative_tolerance")&&nonlinear<=value("nonlinear_relative_tolerance")) {
                 converged=true;reason=transient?"time_steps_converged":"converged";break;
@@ -667,13 +700,13 @@ int run(const fs::path &directory)
                 check(cudaMemcpy(theta.p,old_time.p,in.n*sizeof(double),cudaMemcpyDeviceToDevice));
                 stats();update_losses();components=loss.download();
                 stored=accepted_stored;energy=accepted_energy;
-                flow.zero();heat_flow<<<blocks(in.nf),256>>>(in.nf,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,flow.p);flows=flow.download();
+                flow.zero();heat_flow<<<blocks(in.nf),256>>>(in.nf,face.p,xyz.p,h.p,eps.p,pcb.p,theta.p,c.ambient,c.trad,flow.p,liquid_h.p,coolant.p);flows=flow.download();
             }
             break;
         }
         if(transient) {
             time=target;accepted_stored=stored;accepted_energy=energy;auto max_by_region=maxt.download();double maximum=*std::max_element(max_by_region.begin(),max_by_region.end());
-            time_history<<time<<'\t'<<step<<'\t'<<outer<<'\t'<<maximum<<'\t'<<components[8]<<'\t'<<flows[0]<<'\t'<<flows[1]<<'\t'<<flows[2]<<'\t'<<stored<<'\t'<<energy<<'\n';time_history.flush();
+            time_history<<time<<'\t'<<step<<'\t'<<outer<<'\t'<<maximum<<'\t'<<components[8]<<'\t'<<flows[0]<<'\t'<<flows[1]<<'\t'<<flows[2]<<'\t'<<flows[3]<<'\t'<<stored<<'\t'<<energy<<'\n';time_history.flush();
             if(step%int(value("snapshot_stride"))==0||time>=value("duration_s"))snapshot(time);
         }
         std::cout<<(transient?"time ":"steady solve ")<<(transient?time:0)<<" s: nonlinear iterations "<<outer<<", loss "<<components[8]<<" W, energy error "<<energy<<std::endl;
@@ -690,10 +723,17 @@ int run(const fs::path &directory)
     for (int r = 1; r < in.nr; ++r)
         if (std::abs(generated[r] - powers[r]) > 1e-10 * std::max(1., powers[r]))
             throw std::runtime_error("Integrated source audit failed");
+    Device<double> surface(3);surface.zero();
+    top_surface_stats<<<blocks(in.nf),256>>>(in.nf,face.p,top.p,xyz.p,theta.p,c.ambient,surface.p);
+    auto top_stats=surface.download();
     const char *labels[] = {"high_side_conduction", "high_side_switching", "low_side_conduction", "dead_time_diode", "winding_dc", "winding_ac", "core_unvalidated_placeholder", "auxiliary_ic"};
     std::ofstream json(directory / "solution.json");
     json << std::setprecision(17);
-    json << "{\n\"mode\":\""<<(transient?"transient":"steady_state")<<"\",\n\"steady_state\":"<<(transient?"false":"true")
+    json << "{\n\"cooling_mode\":\""<<((v.count("liquid_mode")&&value("liquid_mode")!=0)?"liquid":"air")<<"\",\n"
+         <<"\"liquid_cooling_w\":"<<flows[3]<<",\n\"top_surface_area_m2\":"<<top_stats[0]<<",\n";
+    json<<"\"top_surface_average_k\":";if(top_stats[0]>0)json<<top_stats[1]/top_stats[0];else json<<"null";
+    json<<",\n\"top_surface_maximum_k\":";if(top_stats[0]>0)json<<top_stats[2];else json<<"null";json<<",\n";
+    json << "\"mode\":\""<<(transient?"transient":"steady_state")<<"\",\n\"steady_state\":"<<(transient?"false":"true")
          <<",\n\"time_s\":"<<time<<",\n\"requested_duration_s\":"<<(transient?value("duration_s"):0)
          <<",\n\"accepted_time_steps\":"<<(transient?(converged?step:step-1):0)
          <<",\n\"storage_w\":"<<stored<<",\n\"time_steps_attempted\":"<<(transient?step:0)<<",\n";

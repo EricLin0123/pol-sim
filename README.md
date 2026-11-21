@@ -82,6 +82,55 @@ conductivity, saturation, AC winding physics and switching waveforms are not
 modeled. The specified lumped PCB path and fixed core loss are uncertain inputs,
 so even a converged numerical result is a preliminary model prediction.
 
+## Selectable air and equivalent liquid cooling
+
+```sh
+uv run python/thermal.py --cooling air
+uv run python/thermal.py --cooling liquid
+uv run python/thermal.py --compare
+uv run python/visualize.py output/thermal_liquid/temperature.vtu
+# Same transient solver and playback, using the liquid boundary:
+uv run python/thermal.py --cooling liquid --transient
+uv run python/visualize.py output/thermal_liquid_transient/temperature.vtu
+```
+
+`thermal.cooling.mode` selects `air` or `liquid`; `--cooling` overrides it for a
+run without editing the original air coefficients. Legacy `still_air` is accepted
+as an alias for `air`. The existing air output paths remain `output/thermal/`
+and `output/thermal_transient/`. Liquid output paths are separate. The old
+root-level `cooling` block is legacy metadata; the selector is under `thermal`.
+
+`thermal.cooling.liquid` configures coolant temperature, effective coefficient,
+contact area, other-surface air coefficient, ambient/radiation temperatures, and
+a **report-only** top temperature objective. Actual case values remain in the
+ignored local configuration. The existing tagged inductor top must match the
+configured contact area. IC ledges, sides, and the bottom are not liquid-cooled.
+Other exposed faces use the liquid case's air coefficient and configured radiation model. The covered
+top has neither extra air convection nor radiation. The unchanged PCB contact
+path remains separate; its contact faces are not treated as exposed air faces.
+
+The common CUDA FEM boundary assembly integrates `h*(T_surface-T_coolant)` on
+the boundary triangles. Conductivity and conduction distance are already in the
+tetrahedral stiffness matrix. The finite-volume half-cell series-resistance
+formula applies to cell-centered finite volumes, not these surface-node finite
+elements; adding it here would double-count conduction. No fixed-temperature
+constraint, CFD model, cold-plate geometry, or new meshing method is introduced.
+
+Reports add area-weighted average and maximum top temperatures, separate liquid
+heat removal in watts, and the difference from the design objective. The design
+objective is not sent to the CUDA boundary-condition parameters. Steady-state
+energy balance includes liquid, air convection, radiation, and PCB heat removal;
+transient accounting additionally includes energy storage.
+
+`--compare` runs both steady-state modes with identical mesh and electrical/loss
+parameters through the same code. Outputs go to `output/cooling_comparison/air/`
+and `liquid/`. Only after both runs converge does it write
+`temperature_comparison.png`, `temperature_difference.vtu` (liquid minus air),
+and quantitative results in `comparison.json`. The existing viewer can open the
+difference VTU directly. If either CUDA run fails, the comparison status explains
+the missing result and no temperature comparison is fabricated. `--compare
+--prepare-only` validates both input sets without solving.
+
 ## Temperature evolution and playback
 
 ```sh
