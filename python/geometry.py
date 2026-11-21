@@ -1,5 +1,6 @@
 """Shared module geometry and matplotlib preview; coordinates are millimeters."""
 import argparse
+import copy
 import json
 import math
 from pathlib import Path
@@ -43,11 +44,20 @@ def build_model(config, footprint, demo_winding=False):
                 bodies=bodies, pad_z_mm=ic['min_mm'][2], footprint=footprint)
     for body in bodies:
         body['role'] = 'envelope'
-    params = config.get('inductor', {}).get('winding_geometry')
+    ic['material'] = g.get('ic_fill_material')
+    ind['material'] = 'metal_composite'
+    model['thermal_materials'] = copy.deepcopy(config.get('materials',{}).get('thermal',{}))
+    inductor = config.get('inductor', {})
+    params = inductor.get('winding_geometry')
     if demo_winding:
+        supplied = params or {}
         params = demo_parameters([b-a for a,b in zip(ind['min_mm'],ind['max_mm'])])
+        if supplied.get('insulation_clearance_mm') is not None:
+            params['insulation_clearance_mm'] = supplied['insulation_clearance_mm']
     if params and (demo_winding or params.get('topology')):
-        add_inductor_parts(model, params, illustrative=demo_winding)
+        if inductor.get('winding_composite_contact') == 'direct' and params.get('insulation_clearance_mm') != 0:
+            raise ValueError('Direct copper/composite contact requires zero insulation_clearance_mm')
+        add_inductor_parts(model, params, illustrative=demo_winding,terminal_material=inductor.get('terminal_material'))
     if config.get('die'):
         add_die(model, config['die'])
     add_pins(model, g)
@@ -59,16 +69,19 @@ def build_model(config, footprint, demo_winding=False):
                 overlaps.append([a['name'],b['name']])
     model['meshing_status'] = dict(ready=False, pin_overlap_candidates=overlaps,
         unplaced_heat_sources=[s['name'] for s in model.get('heat_sources',[]) if s['min_mm'] is None],
-        unresolved=['IC envelope lacks partitioned EMC, leadframe, and die-attach geometry',
-                    'PCB layers, copper, vias, solder joints, and cooling interface are unspecified',
+        unresolved=['PCB layers, copper, vias, solder joints, and cooling interface are unspecified',
                     'Conformal Boolean partition and volume mesh have not been generated'])
+    if not ic['material']:
+        model['meshing_status']['unresolved'].append('IC fill material is unassigned')
+    else:
+        model['assumptions'].append('IC package remainder uses '+ic['material']+'; no internal leadframe or separate die-attach layer')
     if not pins:
         model['meshing_status']['unresolved'].append('Pin lands still lack volume thickness')
     if not model.get('capsules'):
         model['meshing_status']['unresolved'].append('Device winding and terminal dimensions are unspecified')
     elif model.get('inductor_detail',{}).get('illustrative'):
         model['meshing_status']['unresolved'].append('Winding and terminal dimensions are illustrative, not established')
-    if model.get('composite_region'):
+    if model.get('composite_region',{}).get('wire_clearance_mm',0) > 0:
         model['meshing_status']['unresolved'].append('Wire insulation/clearance region has no assigned material')
     return model
 
@@ -151,7 +164,8 @@ def plot_model(model, screenshot=None, backend=None):
         return artist
     detailed = bool(model.get('capsules'))
     for b in model['bodies']:
-        color = ('slategray' if b.get('material') == 'silicon' else 'silver' if b.get('material') == 'terminal_metal' else
+        is_terminal = b['name'].startswith('terminal_')
+        color = ('slategray' if b.get('material') == 'silicon' else '#b87333' if is_terminal and b.get('material') == 'copper' else 'silver' if is_terminal else
                  'royalblue' if b['name'] == 'ic_package' else 'dimgray' if detailed else 'orange')
         x0,y0,z0 = b['min_mm']
         x1,y1,z1 = b['max_mm']
@@ -160,8 +174,8 @@ def plot_model(model, screenshot=None, backend=None):
         faces = [[vertices[i] for i in face] for face in
                  ((0,1,2,3),(4,5,6,7),(0,1,5,4),(1,2,6,5),(2,3,7,6),(3,0,4,7))]
         alpha = 0.10 if b['name'] == 'inductor' and detailed else 0.65 if b.get('role') == 'solid' else 0.20
-        label = ('Silicon die' if b.get('material') == 'silicon' else 'Metal terminals' if b.get('material') == 'terminal_metal'
-                 else 'IC package envelope' if b['name'] == 'ic_package' else 'Metal composite' if detailed else 'Inductor envelope')
+        label = ('Silicon die' if b.get('material') == 'silicon' else 'Copper terminals' if is_terminal and b.get('material') == 'copper' else 'Metal terminals' if is_terminal
+                 else 'IC package EMC' if b['name'] == 'ic_package' and b.get('material') == 'ic_epoxy_molding_compound' else 'IC package envelope' if b['name'] == 'ic_package' else 'Metal composite' if detailed else 'Inductor envelope')
         register(label, ax.add_collection3d(Poly3DCollection(faces, facecolor=color, edgecolor='black', alpha=alpha)))
     if detailed:
         import numpy as np

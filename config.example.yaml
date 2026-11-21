@@ -11,6 +11,8 @@ electrical:
   operating_point: {vin_v: null, vout_v: null, iout_a: null, switching_frequency_khz: null}
 inductor:
   type: null
+  terminal_material: null
+  winding_composite_contact: null
   nominal_inductance_h: null
   winding_geometry:
     # Unknown device internals: set values only from measurements or an explicit assumption.
@@ -26,6 +28,7 @@ inductor:
     segments_per_turn: null # Tessellation only; integer 12..1024.
 geometry:
   units: mm
+  ic_fill_material: null
   module_footprint_mm: null
   target_total_height_mm: null
   ic_height_mm: null

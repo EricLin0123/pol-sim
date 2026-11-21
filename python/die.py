@@ -63,4 +63,4 @@ def add_die(model, proposal):
     model['assumptions'].extend([
         'Hypothetical die and FET floorplan; heat sources are annotations within silicon, not separate materials',
         'Heat-source volumes subdivide host silicon; subtract them from the background die when meshing',
-        'IC package remains an envelope; leadframe, die attach, and EMC fill geometry are not assigned'])
+        'IC outer box is an envelope; its remaining volume uses the configured fill material'])

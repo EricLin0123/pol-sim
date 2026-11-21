@@ -3,8 +3,70 @@
 Research foundation for **CUDA-Accelerated Thermal and Electromagnetic Simulation
 of Integrated-Inductor DC-DC Power Modules**, including top liquid cooling.
 All numerical solvers will use CUDA C++17; Python handles geometry, processing,
-plots, animation, and interactive viewing. No physics models, CPU solvers,
-simulation meshes, or loss estimates are implemented yet.
+plots, animation, interactive viewing, and Gmsh volume meshing. No thermal/EM
+solver or loss estimates are implemented yet.
+
+## Volume meshing (no solver)
+
+```sh
+uv run python/mesh.py
+# Inspect labeled tetrahedra:
+uv run python/visualize.py output/mesh/module.vtu --scalar region_id
+# Or open Gmsh's mesh interface:
+uv run python/mesh.py --view
+# Adjust discretization without changing physical dimensions:
+uv run python/mesh.py --size 0.20 --fet-size 0.02
+```
+
+The mesh viewer starts with black element edges and a movable cutaway plane.
+Drag the plane to reveal interior tetrahedra, or rotate its normal to change
+the cutting direction. The sidebar toggles edges, clipping, and individual
+regions; hide EMC/composite to see the winding and die unobstructed. Cutaway
+retains whole tetrahedra so their actual faces remain visible. Moving the camera
+inside an opaque outer surface alone does not provide a useful interior cut.
+These display controls do not modify the saved mesh.
+
+The mesher rebuilds the current local model, including the explicitly labeled
+illustrative winding if actual winding parameters remain unset. Use
+`--model path/to/module.json` to mesh an explicit saved model instead.
+Input needs finite copper pins and placed FET source regions. No CUDA, GPU, or
+thermal solver is used. All geometry and mesh coordinates remain in millimeters.
+
+Gmsh constructs rounded copper prisms, the wire's capsule union, terminals,
+clearance, die and package envelopes; unions overlapping copper pins; and
+fragments all solids together. FETs partition silicon rather than overlap it.
+Each tetrahedron belongs to exactly one region. `geometry.ic_fill_material`
+sets the remaining IC volume's material; the simplified EMC fill excludes die
+and pins and introduces no leadframe. `inductor.terminal_material` sets terminal
+material. Zero `insulation_clearance_mm` gives direct copper/composite contact
+and creates no insulation volume. Positive clearance creates a separately
+unassigned sleeve. Demo winding dimensions respect the configured clearance.
+The mesh report includes each region's stored thermal properties and lists
+any missing material assignments. Control logic without geometry,
+PCB, solder joints, and cooling interface layers are omitted. `top_cooling_candidate`
+is only a surface label; no cooling condition is applied.
+
+Outputs under ignored `output/mesh/`:
+
+- `module.msh`: Gmsh mesh with physical region and exterior-boundary groups.
+- `module.brep`: partitioned solid geometry (labels are in the report/mesh).
+- `module.vtu`: tetrahedral mesh with region and quality cell fields for PyVista.
+- `module.npz`: `points_mm`, zero-based `tetrahedra`, `region_id`,
+  `element_volume_mm3`, `quality_minSICN`, exterior triangles/IDs, and interface
+  triangles/region pairs. Triangle orientation is not guaranteed outward.
+- `report.json`: region-to-material mapping, CAD/mesh volumes, element counts,
+  quality statistics, assumptions and unresolved geometry.
+- `input_geometry/`: snapshot of the geometry actually meshed.
+
+Validation checks positive tetrahedron volumes, complete region ownership,
+matching assembly volume, shared interior triangle connectivity, and absence
+of unexpected free/nonmanifold faces. Local refinement targets FET surfaces;
+defaults are bulk size 0.30 mm and FET size 0.04 mm. These are initial meshing
+settings, not a convergence claim or a guarantee of multiple layers through
+thin regions. The report flags elements with minSICN below 0.05 as a quality
+diagnostic. Skinny elements can remain near capsule joints/clearance boundaries;
+inspect and improve them before future solving. A valid conformal mesh does
+not establish thermal-model completeness or simulation accuracy.
 
 Requirements: NVIDIA CUDA Toolkit, a compatible NVIDIA GPU and driver for execution,
 CMake 3.24+, a CUDA-compatible C++ compiler, Python 3.11+, and `uv`.
@@ -66,7 +128,8 @@ UV_CACHE_DIR=/tmp/pol-sim-uv-cache uv run python python/visualize.py output/resu
 The local geometry configuration now defines a centered IC package and inductor
 stack, with the package bottom at z=0 and no additional interface thickness.
 These are assumed outer envelopes, not internal die, winding, or core geometry.
-Material properties are kept in local configuration. No solver mesh is generated.
+Material properties are kept in local configuration. Geometry generation and
+meshing are separate commands.
 
 `data/footprint.json` is the shared source for pin geometry and net definitions.
 The generator preserves its original coordinates, provenance, warnings, and
@@ -120,8 +183,9 @@ retained separately; an unset power is not zero. Control logic stays unplaced
 unless its geometry is supplied. FET annotations remain silicon, not extra solids.
 `heat_source_surface` may be `top`, `bottom`, or null. A null surface preserves the
 specified depth but leaves source z bounds unresolved. When a surface is specified, the viewer draws finite-depth FET subvolumes;
-otherwise it shows labeled projections only. A separate floorplan remains visible. The package remains an
-envelope because its internal leadframe, die attach, and molding fill are unknown.
+otherwise it shows labeled projections only. A separate floorplan remains visible.
+The package outer box describes an envelope; its remainder uses the configured
+fill material after the die and pins are removed.
 In `HEAT_SOURCE` records, `has_xy=0` means the four following coordinates are
 ignored; `surface="unresolved"` forbids inferring source z. CUDA readers retain
 unknown powers/areas as `std::nullopt`, not zero. Geometry status is preserved.
@@ -140,8 +204,8 @@ source solids to an intact die would double-count volume. C++ heat-source
 candidates, unplaced heat sources, and remaining geometry omissions. This is
 an input audit, not a guarantee of a watertight mesh. The package is still an
 envelope, and the composite is a difference-region description. A conformal
-Boolean partition, material assignment to every remaining region, and actual
-volume meshing are still required. Preview triangles/tubes are display assets,
+Boolean partition and volume meshing are performed by `mesh.py`; the
+geometry export itself is not a mesh. Preview triangles/tubes are display assets,
 not a closed, stitched simulation mesh.
 
 Parametric choke internals are implemented in `python/inductor.py`. Configure
@@ -151,8 +215,8 @@ radius, winding height and bottom offset, insulation clearance, terminal size
 and radial location, and tessellation. Winding bottom is relative to the
 inductor bottom. An integer turn count places terminals at the same angle and
 is rejected if they overlap; this topology does not represent every choke.
-The material of the terminals, insulation properties, and composite properties
-remain unspecified. Inductance is not computed or calibrated by this generator.
+Materials are referenced by name and stored thermal properties are copied into
+local JSON exports. A zero clearance removes the insulation region entirely. Inductance is not computed or calibrated by this generator.
 
 Unknown device internals remain null. To inspect explicitly illustrative
 parameters without changing the device configuration or canonical exports:
@@ -170,7 +234,7 @@ and CUDA input. The viewer shows the composite's transparent outer boundary;
 its interior is defined by constructive geometry in the exports, not a volume
 mesh. Material priority is the copper capsule union, terminal boxes minus
 copper, then composite envelope minus terminals and clearance-expanded capsules.
-The intervening clearance sleeve has no assigned material. Envelope boxes are
+A sleeve exists only for positive clearance and then needs its own material. Envelope boxes are
 not additional physical solids. These rules prevent material double counting
 when downstream solvers implement region classification. Geometric checks
 cover containment, winding pitch, and terminal overlap, not all manufacturing

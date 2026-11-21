@@ -21,7 +21,7 @@ def demo_parameters(size):
     )
 
 
-def add_inductor_parts(model, params, illustrative=False):
+def add_inductor_parts(model, params, illustrative=False, terminal_material=None):
     body = next(b for b in model["bodies"] if b["name"] == "inductor")
     lo, hi = body["min_mm"], body["max_mm"]
     if params["topology"] != "round_wire_helix":
@@ -32,7 +32,6 @@ def add_inductor_parts(model, params, illustrative=False):
         "centerline_radius_mm",
         "winding_height_mm",
         "winding_bottom_mm",
-        "insulation_clearance_mm",
         "terminal_radial_center_mm",
     )
     for key in required:
@@ -41,7 +40,9 @@ def add_inductor_parts(model, params, illustrative=False):
             raise ValueError(f"Provide a positive finite winding_geometry.{key}")
     turns = params["turns"]
     radius = params["wire_diameter_mm"] / 2
-    clearance = params["insulation_clearance_mm"]
+    clearance = params.get("insulation_clearance_mm")
+    if clearance is None or not math.isfinite(clearance) or clearance < 0:
+        raise ValueError('insulation_clearance_mm must be finite and nonnegative')
     r = params["centerline_radius_mm"]
     height = params["winding_height_mm"]
     bottom = lo[2] + params["winding_bottom_mm"]
@@ -81,7 +82,7 @@ def add_inductor_parts(model, params, illustrative=False):
         cx, cy = outer * math.cos(theta), outer * math.sin(theta)
         terminal = dict(
             name=f"terminal_{index+1}",
-            material="terminal_metal",
+            material=terminal_material or "terminal_metal",
             role="solid",
             min_mm=[cx - size[0] / 2, cy - size[1] / 2, lo[2]],
             max_mm=[cx + size[0] / 2, cy + size[1] / 2, lo[2] + size[2]],
@@ -128,7 +129,7 @@ def add_inductor_parts(model, params, illustrative=False):
         ):
             raise ValueError("Terminal leaves inductor envelope")
     # The shell is a difference region, not an overlapping solid box of composite.
-    body.update(material=None, role="envelope")
+    body.update(material='metal_composite', role="envelope")
     model["bodies"].extend(terminals)
     model["capsules"] = capsules
     model["material_priority"] = [
@@ -149,8 +150,9 @@ def add_inductor_parts(model, params, illustrative=False):
     model["inductor_detail"] = dict(
         parameters=params,
         illustrative=illustrative,
-        terminal_material_properties=None,
-        composite_material_properties=None,
+        terminal_material=terminal_material or "terminal_metal",
+        composite_material='metal_composite',
+        winding_composite_contact='direct' if clearance == 0 else 'clearance',
         validated_against_reference=False,
         inductance_calibrated=False,
     )
@@ -158,7 +160,8 @@ def add_inductor_parts(model, params, illustrative=False):
         [
             "Unverified round-wire helix with radial/vertical leads; no pin-to-terminal mapping",
             "Composite = envelope minus terminal boxes and clearance-expanded wire capsules",
-            "Clearance region has no assigned insulation material; terminal metal unspecified",
+            ('Direct copper/composite contact; no insulation region' if clearance == 0 else
+             'Clearance region has no assigned insulation material'),
             "Geometry is not calibrated to nominal inductance; no manufacturing validation",
         ]
     )
