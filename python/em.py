@@ -208,18 +208,21 @@ def compare(config,args):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,default=ROOT/'config.yaml');p.add_argument('--output',type=Path,default=ROOT/'output/em');p.add_argument('--executable',type=Path,default=ROOT/'build/em')
-    p.add_argument('--pcb',action='store_true',help='Include the existing 1 mm FR4 board slab (passive mu=1 copper has no magnetostatic effect)')
+    p.add_argument('--pcb',action='store_true',help='Full PCB geometry is included by default')
     action=p.add_mutually_exclusive_group();action.add_argument('--validate-module',action='store_true');action.add_argument('--benchmark',action='store_true');action.add_argument('--validate',action='store_true');action.add_argument('--compare',action='store_true');action.add_argument('--postprocess-only',action='store_true')
     p.add_argument('--prepare-only',action='store_true');p.add_argument('--reuse-mesh',type=Path);p.add_argument('--size',type=float);p.add_argument('--padding',type=float)
     args=p.parse_args();config=yaml.safe_load(args.config.read_text())
     if args.pcb:config['em'].setdefault('geometry',{})['include_pcb_dielectric']=True
     try:
-        if args.validate_module:validate_module(config,args)
+        if args.validate_module or args.compare:
+            raise ValueError('Isolated-module sweeps are retired. Use full-domain runs with --size/--padding in separate output directories.')
         elif args.validate:validate(config,args)
-        elif args.compare:compare(config,args)
         elif args.postprocess_only:postprocess(args.output,config)
-        else:run(config,args.output,args,args.benchmark,args.size,args.padding,args.reuse_mesh)
-    except (ValueError,RuntimeError,OSError,KeyError) as error:
+        elif args.benchmark:run(config,args.output,args,True,args.size,args.padding,args.reuse_mesh)
+        else:
+            from em_full import run as full_run
+            full_run(config,args)
+    except (ValueError,RuntimeError,OSError,KeyError,subprocess.CalledProcessError) as error:
         failure_dir=args.output/('module_validation' if args.validate_module else 'validation' if args.validate else 'permeability' if args.compare else '')
         failure_dir.mkdir(parents=True,exist_ok=True)
         (failure_dir/'run_status.json').write_text(json.dumps(dict(status='failed',error=str(error)))+'\n')

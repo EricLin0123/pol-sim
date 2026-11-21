@@ -499,164 +499,52 @@ Repair/verify connectivity and fragment the entire assembly before volume meshin
 then supply frequency-dependent EM materials, air domain, ports and boundaries.
 The existing thermal mesh and solver inputs are unchanged.
 
-## CUDA 3D magnetic field: first magnetostatic milestone
+## Full module and PCB magnetic simulation
 
 ```sh
-cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=75 # Or native on a working GPU host
-cmake --build build --target em -j 2
+cmake --build build --target em -j 4
 ./build/em --self-test
 uv run python/em.py
 uv run python/visualize.py output/em/magnetic.vtu
-# Export the actual native field snapshots as an animated GIF:
 uv run python/em_view.py output/em/magnetic.vtu --gif output/em/field.gif
-# Optional existing FR4 slab; still one energized module:
-uv run python/em.py --pcb --output output/em_pcb
-uv run python/visualize.py output/em_pcb/magnetic.vtu
 ```
 
-This is **linear magnetostatics followed by a quasistatic, no-eddy-current
-approximation**, not a transient conductive MQS/A–φ implementation. Native CUDA
-assembles the operator and source, solves for oriented edge integrals of A,
-computes cell vectors B=curl(A), independently checks a second current, computes
-the buck waveform, and scales the vector field into physical-time snapshots.
-Python constructs geometry/topology, orchestrates runs, evaluates analytical
-references, computes summaries, and visualizes results. There is no CPU field
-solver or fabricated field fallback. A CUDA device with double atomicAdd support
-(compute capability >=6.0) is required to solve. A missing driver or unconverged
-solve produces an error and no published field series. Existing thermal inputs,
-mesh, executable and solvers remain separate.
+The default run replaces generated contents of `output/em/`. It meshes the complete
+module, copper clips, FET contacts and silicon regions, winding, PCB top copper,
+via barrels, FR4, external supply/load fixtures, and surrounding air. Output
+destinations must be inside the project's `output/` directory. Use `--prepare-only`
+for meshing without solving, or `--reuse-mesh output/em` to reuse a full-buck mesh
+when geometry and mesh settings have not changed. `--pcb` is a compatibility flag;
+the PCB is always included.
 
-The local user-authorized demonstration uses the existing illustrative helix,
-0.12 mm wire radius and an explicit external return at terminal height, routed
-around the package. Coordinates are saved in `em.source.return_path_mm`; this
-is not a verified PCB buck loop. The public template leaves that path unset.
-Actual winding dimensions remain unknown. `em.source.use_illustrative_winding`
-controls the existing demo geometry; disable it only after setting real
-`inductor.winding_geometry` values. The source follows terminal 1 → lead 1 →
-helix → lead 2 → terminal 2 → configured return → terminal 1. All source paths
-are checked against the copper material volumes. Source return coordinates must
-start/end at the corresponding terminal centers; an open source is rejected.
+Python solves a scalar conduction problem on the actual conductor tetrahedra for
+two switching states, with high-side and low-side conduction mutually exclusive.
+FET conductivities approximate configured on resistance. A winding-aligned impressed
+electric field drives a normalized current; the ideal CCM waveform sets its physical
+amplitude. No additional copper loop is placed around the inductor, and the former
+`em.source.return_path_mm` is unused. Load resistance follows VOUT/IOUT. The external
+supply and load are explicit assumed fixtures at the board perimeter, with the load
+return routed to the connected lower PGND band. Isolated copper remains passive.
 
-The source is a finite-radius closed-filament area quadrature inside swept copper
-volumes, not an infinitely thin centerline and not a solved conductor current
-distribution. Radial/azimuthal quadrature controls are in YAML. Every straight
-filament segment is clipped into tetrahedra, with exact Whitney basis line
-integrals between barycentric endpoints. GPU assembly therefore preserves
-current continuity at the discrete nodal-gradient level, including bends and
-return conductors. Uniform cross-sectional current is only approximated; refine
-source quadrature before making quantitative predictions near conductors.
+The distributed current density is integrated against edge basis functions.
+A bounded correction confined to conducting edges removes numerical continuity
+error. Independent cross-sections check the load, supply, high-side and low-side
+currents against inductor current. Native CUDA solves the magnetic edge FEM system
+for each state and checks current continuity, normal magnetic flux continuity,
+residual and independent-current linearity. Time snapshots select the appropriate
+state and apply the triangular inductor current; they are not one scaled DC field.
 
-The air mesh is an explicit OpenCASCADE partition of the module, winding,
-configured return and external box. First-order **Nédélec/Whitney edge elements**
-replace the thermal solver's scalar nodal unknowns. Global edge directions and
-signs enforce tangential A continuity; their element curls produce constant-cell
-B with continuous normal flux. The implementation follows the H(curl)
-magnetostatic structure described in [MFEM's magnetostatic formulation](https://mfem.org/tesla-notes/).
-The matrix-free GPU operator integrates curl(Ni)·curl(Nj)/μ in each tetrahedron.
+`domain.msh`, `domain.brep` and `domain.npz` hold the domain. `current_on.npz` and
+`current_off.npz` contain normalized conductor current densities and scalar
+potentials. `on/` and `off/` retain the independent GPU solves. `magnetic.vtu`
+contains average B, both state fields and both current densities. `times.bin`,
+`current.bin`, `switch_states.npz` and `B_series.bin` hold physical-time playback.
+`report.json` records assumptions, audits and limitations. `--benchmark` and
+`--validate` retain the separate analytical circular-loop tests.
 
-The discrete gradient G maps interior nodal potentials to edge integrals, with
-boundary potentials fixed to zero. Gauge freedom is removed by adding
-`alpha*G*G^T` and using diagonal-preconditioned conjugate gradients. This is an
-algebraic gauge, not an A mass regularization: the closed source satisfies
-`G^T*f=0` and the curl-curl operator annihilates G, so the extra term enforces
-`G^T*A=0` without changing the magnetostatic B solution. Mesh topology must be a
-connected, filled, contractible air box with one outer boundary. Topology checks
-reject unsupported domains. The outer boundary fixes tangential A to zero,
-implying zero normal B there; it is a finite-domain approximation to open space,
-so air-padding sensitivity must be checked. No infinite-element boundary is used.
-
-`em.materials` exposes μr and conductivity for copper, composite, epoxy, silicon,
-FR4 and air. The initial composite μr=50 is hypothetical and linear. Silicon
-conductivity is unset/configurable. **All conductivities are unused in this
-milestone**, so unknown conductivity cannot silently turn into an eddy-current
-prediction. Selecting any mode other than `quasistatic_no_eddy` raises an error.
-There is no saturation, hysteresis, skin/proximity effect, conductive shielding,
-or core-loss model. Magnetic permeability comparisons show flux redistribution,
-not validated shielding performance. The assumed 220 nH sets the ideal buck
-current ripple only; it does not calibrate the illustrative winding's inductance.
-
-The configured 12 V → 1 V, 20 A, 1 MHz buck point gives duty 1/12, ripple
-4.166667 A peak-to-peak, and currents 17.916667–22.083333 A. The rising interval
-is 83.333 ns and the falling interval 916.667 ns. Sampling includes every
-switching corner and several full periods. B changes in magnitude with current;
-its direction does not reverse because the current stays positive. Time-scaled
-magnetostatics has no diffusion delay or conductive phase lag.
-
-`--pcb` reuses the existing rectangular FR4 slab from `pcb.assembly_3d`, translated
-so the first module's package bottom remains z=0. It adds a labeled PCB field
-region to the air-domain mesh. Passive PCB copper with μr=1 is
-magnetically equivalent to air in this no-eddy-current model and is omitted;
-its conductivity and any real PCB return currents must be included in a future
-conductive formulation. All driving return current presently follows the
-explicit modeled external conductor. This does not solve the entire three-phase
-PCB's current distribution.
-
-Outputs under `output/em/` (or `--output`) include `domain.msh`, `domain.brep`,
-`domain.npz`, `mesh_report.json`, `topology.npz`, native `input.bin`,
-`input.json`, `parameters.txt`, `A_edges.bin`, `B_dc.bin`, `B_series.bin`,
-`current.bin`, `times.bin`, `solution.json`, `magnetic.vtu`, `report.json`,
-`summary.png`, `leakage_planes.npz` and `leakage.png`. Binary doubles are
-little-endian; B arrays are `(tetrahedron,xyz)` or `(time,tetrahedron,xyz)` in T.
-`A_edges.bin` stores edge integrals in Wb. VTK coordinates remain mm and fields
-are exported in T/mT. The input report records material assumptions and config
-hash. Native flux-jump, current-continuity, independent-current linearity, and
-true PCG residual audits are in `solution.json`.
-
-The viewer uses native vector snapshots, fixed logarithmic mT colors, physical
-time scrubbing/playback, a draggable cutaway/field plane, directional arrows,
-optional streamlines, and independent region visibility. Hidden geometry still
-contributes to the solved field. Streamlines use a display-only cell-to-node
-reconstruction; raw cell B and flux audits are unchanged. Leakage maps sample
-planes above and beside the module; maximum and volume-average |B| for each
-material region are recorded at the configured mean current. Playback speed is
-a display setting, not physical time.
-
-```sh
-# Prepare without solving; useful on hosts without a working GPU:
-uv run python/em.py --prepare-only
-# Reuse an existing identical geometry mesh when changing material values:
-uv run python/em.py --reuse-mesh output/em --output output/em_rerun
-# Loop analytical reference + mesh/domain refinement sweeps:
-uv run python/em.py --benchmark --output output/em_loop
-uv run python/em.py --validate --output output/em
-# Same module mesh, mu_r = 1, 10, 50, 100:
-uv run python/em.py --compare --reuse-mesh output/em --output output/em
-# Preprocessing regression checks (no CPU magnetic solve):
-uv run python -m unittest discover -s tests -p 'test_em_preprocessing.py' -v
-```
-
-`--reuse-mesh` explicitly reuses saved geometry/source paths; changing dimensions
-or return coordinates requires generating a fresh mesh. Permeability comparisons
-save each case's VTU/time series, `permeability/comparison.json`, and a comparison
-plot. μr=1 retains the composite region's shape while replacing its magnetic
-properties with air-equivalent properties. A failed case never generates a
-complete comparison report.
-
-The loop validation checks the analytical axial field
-`Bz=mu0*I*R²/(2*(R²+z²)^(3/2))`, positive field orientation for counterclockwise
-current, independent-current linearity, normal flux continuity, mesh refinement
-and air-boundary sensitivity. The reference is an ideal thin circular loop;
-finite wire-radius and polygonal-source differences contribute to reported error.
-Both raw containing-cell B errors and patch-recovered point-field errors are
-reported. Acceptance applies to recovered probe fields on the finest mesh and
-largest domain; coarse errors remain visible. Configurable thresholds and all
-case results are in `validation/report.json`. These loop checks do not establish
-module/core-contrast mesh convergence or experimental device validity. In
-particular, local peak B near material corners and discrete source filaments can
-be sensitive to mesh/source resolution; linear high-μ predictions can exceed the
-range where a real magnetic composite would remain unsaturated. Full transient
-conductive A–φ MQS remains a later milestone, after device-specific geometry and
-return-path validation.
-
-Device-specific sensitivity checks can reuse a solved baseline:
-
-```sh
-uv run python/em.py --validate-module --reuse-mesh output/em --output output/em
-```
-
-`module_validation/report.json` compares a refined module mesh, larger air
-domain, and doubled radial source quadrature against the baseline. It reports
-core volume-average and maximum B and recovered vectors at fixed leakage probes.
-Configured acceptance checks use core averages and probe changes, not singular
-local peaks. This is a one-step sensitivity check, not asymptotic convergence
-or validation of the assumed winding/return against a real converter.
+This is a linear quasistatic, no-eddy-current model. It does not solve device/circuit
+transients, dead time, switching edges, saturation, hysteresis, skin/proximity effects
+or frequency-dependent losses. Supply/load fixture geometry, FET contacts, internal
+winding and reference copper connectivity remain modeling assumptions. Mesh/domain
+convergence and experimental validity are not established. The previous isolated
+loop results do not validate this full-board model.

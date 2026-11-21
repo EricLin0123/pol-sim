@@ -92,7 +92,7 @@ struct Input
         ns = c[3];
         nf = c[4];
         nframes = c[5];
-        if (std::min({n, nt, ne, ns, nf, nframes}) <= 0 || std::max({n, nt, ne, ns, nf, nframes}) > 100000000)
+        if (std::min({n, nt, ne, nf, nframes}) <= 0 || ns < 0 || std::max({n, nt, ne, ns, nf, nframes}) > 100000000)
             throw std::runtime_error("Invalid EM counts");
         xyz = read<double>(f, size_t(n) * 3);
         tet = read<int>(f, size_t(nt) * 4);
@@ -560,6 +560,8 @@ int main(int argc, char **argv)
         double mean = m.at("current_a");
         if (!(mean > 0) || !(m.at("vin_v") > m.at("vout_v")) || !(m.at("vout_v") > 0) || !(m.at("inductance_h") > 0) || !(m.at("frequency_hz") > 0))
             throw std::runtime_error("Invalid buck operating point");
+        if (h.ns == 0 && !fs::exists(out / "rhs_edges.bin"))
+            throw std::runtime_error("Distributed source requires rhs_edges.bin");
         Solver s(h);
         Device<int> source(h.ns), edges(h.edges.size());
         Device<double> a(h.sa.size()), b(h.sb.size()), weights(h.ns), div(h.n);
@@ -569,7 +571,21 @@ int main(int argc, char **argv)
         weights.put(h.weight);
         edges.put(h.edges);
         s.rhs.zero();
-        assemble_source<<<blocks(h.ns), 256>>>(h.ns, source.p, s.te.p, a.p, b.p, weights.p, mean, s.rhs.p);
+        if (fs::exists(out / "rhs_edges.bin"))
+        {
+            std::ifstream input_rhs(out / "rhs_edges.bin", std::ios::binary);
+            auto values = read<double>(input_rhs, h.ne);
+            for (double &v : values)
+            {
+                if (!std::isfinite(v)) throw std::runtime_error("Nonfinite distributed source");
+                v *= mean;
+            }
+            s.rhs.put(values);
+        }
+        else
+        {
+            assemble_source<<<blocks(h.ns), 256>>>(h.ns, source.p, s.te.p, a.p, b.p, weights.p, mean, s.rhs.p);
+        }
         div.zero();
         divergence_current<<<blocks(h.ne), 256>>>(h.ne, edges.p, s.rhs.p, div.p);
         double continuity = 0;

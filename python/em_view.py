@@ -15,7 +15,7 @@ def view(path, screenshot=None, gif=None, stride=3, streamlines=False):
     plot=pv.Plotter(off_screen=screenshot is not None or gif is not None,window_size=(1500,950));plot.set_background('white')
     regions={int(k):r for k,r in mesh_report['regions'].items()};region_id=np.asarray(grid.cell_data['region_id'])
     state=dict(index=0,playing=False,normal=(0,1,0),origin=grid.center,glyphs=True,streamlines=streamlines,cutaway=True)
-    maximum=float(np.max(grid.cell_data['B_magnitude_mT'])*np.max(np.abs(current))/meta['mean_current_a'])
+    maximum=float(meta.get('series_maximum_B_mT',np.max(grid.cell_data['B_magnitude_mT'])*np.max(np.abs(current))/meta['mean_current_a']))
     maximum=max(maximum,1e-12)
     clim=(max(maximum*1e-6,1e-8),maximum)
     physical=grid.extract_cells(np.flatnonzero(region_id!=next((i for i,r in regions.items() if r['material']=='air'),-1)))
@@ -57,15 +57,15 @@ def view(path, screenshot=None, gif=None, stride=3, streamlines=False):
         plot.render()
     def plane(normal,origin):state.update(normal=normal,origin=origin);refresh()
     plot.add_plane_widget(plane,normal=state['normal'],origin=state['origin'],bounds=roi,normal_rotation=True,outline_opacity=.15)
-    def checkbox(label,callback,y,value):
-        plot.add_checkbox_button_widget(callback,value=value,position=(12,y),size=18,color_on='#356b9a',color_off='lightgray');plot.add_text(label,position=(38,y),font_size=9,color='black')
+    def checkbox(label,callback,y,value,x=12):
+        plot.add_checkbox_button_widget(callback,value=value,position=(x,y),size=18,color_on='#356b9a',color_off='lightgray');plot.add_text(label,position=(x+26,y),font_size=9,color='black')
     def cut(value):state['cutaway']=bool(value);refresh()
     def vectors(value):state['glyphs']=bool(value);refresh()
     def streams(value):state['streamlines']=bool(value);refresh()
     checkbox('Cutaway',cut,820,True);checkbox('Field directions',vectors,790,True);checkbox('Streamlines (display reconstruction)',streams,760,streamlines)
     for i,(rid,region) in enumerate(regions.items()):
         def visible(value,r=rid):actors[r].SetVisibility(bool(value));plot.render()
-        checkbox(region['name'],visible,710-i*28,region['material']!='air')
+        checkbox(region['name'],visible,710-(i%17)*28,region['material']!='air',x=12+(i//17)*230)
     def set_time(t):state['index']=int(np.argmin(abs(times-float(t)*1e-6)));refresh()
     slider=plot.add_slider_widget(set_time,(0,times[-1]*1e6),value=0,title='Physical time (µs)',color='#356b9a',title_color='black',slider_width=.015,tube_width=.004,pointa=(.35,.07),pointb=(.82,.07),interaction_event='always')
     slider.GetRepresentation().GetLabelProperty().SetColor(0,0,0)
