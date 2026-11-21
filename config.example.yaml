@@ -43,6 +43,14 @@ geometry:
   pin_bottom_z_mm: null # Relative to package bottom.
 die: null # Optional hypothetical die/floorplan; configure in local config.yaml.
 pcb:
+  assembly_3d:
+    copper_thickness_mm: 0.02 # User assumption, applies to PCB copper only.
+    dielectric_thickness_mm: null # Set to model a substrate beneath z=0.
+    dielectric_material: fr4
+    top_copper_bottom_z_mm: 0.0
+    module_rotation_deg: 0.0 # Footprint orientation remains unverified.
+  # Copy reference parameters from ref/layout_params.yaml; footprint comes from geometry.
+  layout_parameters: null
   layout: null
   vout_region: null
   power_regions: null

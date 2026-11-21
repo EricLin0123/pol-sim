@@ -419,3 +419,67 @@ documents belong in `confidential/` or `inputs/`; proprietary settings belong in
 Ignore rules cannot enforce remote visibility or prevent explicitly forced adds;
 review staged files before committing. Do not commit confidential values into
 source code, the public-safe template, or documentation.
+
+## Three-module PCB reference viewer
+
+```sh
+uv run python/pcb.py
+uv run python/pcb.py --no-view
+uv run python/pcb.py --config config.yaml --output output/pcb/layout
+```
+
+The PCB plan viewer reads `pcb.layout_parameters` in the project `config.yaml`,
+initialized from `ref/layout_params.yaml`, and the module footprint from
+`geometry.module_footprint_mm`. It preserves the repeated tracing from
+`ref/generate_pcb.py` using Matplotlib, with pan/zoom and PNG, SVG, and JSON
+exports under `output/pcb/`. Default paths work from any working directory.
+The view uses millimeters with x right and y down from the reference upper-left.
+Module count, pitch, margin, via diameters, component marker size, and colors
+are configurable. The supplied three-module reference is illustrative; repeated
+VIN segments and VOUT regions do not establish verified parallel connectivity.
+The JSON records placement and unresolved EM inputs, not a conductor mesh.
+Layer stackup, thicknesses, exact copper boundaries, connectivity, materials,
+and ports still require definition before EM simulation. The illustration
+bounds are not a physical board outline. This viewer does not alter the
+single-module thermal geometry or enable an explicit thermal PCB.
+
+## Full 3D PCB assembly
+
+```sh
+uv run python/pcb_3d.py                 # Rotate, zoom, and toggle components
+uv run python/pcb_3d.py --no-view       # Assembly JSON and PNG
+uv run python/pcb_3d.py --no-view --cad # Also export STEP and BREP solids
+```
+
+`pcb.assembly_3d` configures PCB copper thickness (0.02 mm), dielectric
+thickness (locally assumed 1.0 mm FR4), top-copper z, and module z-axis rotation.
+Coordinates are right-handed: x right, y north, z up. FR4 spans -1 to 0 mm,
+copper spans 0 to 0.02 mm, and module package bottoms sit at 0.02 mm. All
+three instances use the existing module definition, including die, pins,
+terminals and the labeled illustrative winding when actual winding inputs are
+missing. Module pin thickness is a separate device parameter and is preserved.
+
+Outputs are in `output/pcb_3d/`: `assembly.json` stores copper prism outlines,
+via radii/depths, substrate bounds, the full module definition and rigid instance
+placements; `assembly.png` previews the assembly at true scale. Checkboxes hide
+package envelopes, substrate, copper, vias, pins and winding independently.
+The Matplotlib preview uses polygon surfaces/tubes; drilled holes and exact
+capsule end caps are represented in CAD rather than the lightweight preview.
+
+`--cad` uses Gmsh/OpenCASCADE to partition the existing single module, replicate
+it three times, extrude the traced PCB copper, drill the substrate/copper and
+add hollow via barrels with 0.02 mm walls and annular top lands. It exports
+`assembly.step`, `assembly.brep`, and `cad_regions.json`. CAD export can take
+several minutes. Region volume tags refer to the generating Gmsh session and
+must be remapped after CAD import. STEP/BREP preserve the volume geometry;
+`assembly.json` retains the source definitions and assumptions.
+
+These are preliminary assembly solids, not a conformal Maxwell mesh. The
+reference is assumed to be a single top copper layer, with no inferred bottom
+plane; the rectangular substrate outline comes from the illustration bounds.
+Traced copper overlaps are retained and may create shorts. Module land alignment,
+net connectivity and winding-to-pin connections remain unverified. Passive body
+markers are omitted because electrical terminal and body geometry are unknown.
+Repair/verify connectivity and fragment the entire assembly before volume meshing;
+then supply frequency-dependent EM materials, air domain, ports and boundaries.
+The existing thermal mesh and solver inputs are unchanged.

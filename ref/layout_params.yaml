@@ -1,0 +1,20 @@
+# Dimensions reconstructed from a raster layout; estimates, NOT fabrication data.
+source_device_config: config.yaml
+modules: 3
+module_pitch_mm: 9.54  # ~661 px / (312 px / 4.5 mm)
+module_footprint_mm: 4.5  # read from source config at runtime
+board_margin_mm: 0.25
+# Full illustrated vertical extent: ~10.14 mm; not a physical PCB outline.
+layout_height_mm: 10.14
+component_0402_size_mm: [1.0, 0.50]  # nominal body size, visual only
+via_outer_diameter_mm: 0.30  # inferred, illustrative
+via_drill_diameter_mm: 0.20  # inferred, illustrative
+colors:
+  pgnd: '#858585'
+  vin: '#548dd2'
+  vout: '#702e9b'
+  signal: '#00b45e'
+  footprint: '#c2c2c2'
+  resistor: '#ffd91d'
+# Pad coordinates and trace boundaries are traced schematically from the image.
+# No copper layer assignment, clearance check, netlist, or manufacturing guarantee.
