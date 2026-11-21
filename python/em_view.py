@@ -42,8 +42,10 @@ def view(path, screenshot=None, gif=None, stride=3, streamlines=False):
         sliced=grid.slice(normal=state['normal'],origin=state['origin']).clip_box(roi,invert=False);slice_actor.mapper.dataset=sliced
         if vector_actor[0] is not None:plot.remove_actor(vector_actor[0]);vector_actor[0]=None
         if state['glyphs'] and sliced.n_cells:
-            centers=sliced.cell_centers();step=max(1,centers.n_points//350);sample=centers.extract_points(np.arange(0,centers.n_points,step))
-            # Arrow length is fixed for direction; color retains actual field magnitude.
+            centers=sliced.cell_centers()
+            step=max(1,centers.n_points//350)
+            sample=centers.extract_points(np.arange(0,centers.n_points,step))
+            # Arrow positions follow the cutaway plane; color shows field magnitude.
             glyph=sample.glyph(orient='B_T',scale=False,factor=max(grid.length*.012,.02))
             vector_actor[0]=plot.add_mesh(glyph,scalars='B_magnitude_mT',clim=clim,log_scale=True,cmap='viridis',show_scalar_bar=False,name='vectors')
         if stream_actor[0] is not None:plot.remove_actor(stream_actor[0]);stream_actor[0]=None
@@ -62,7 +64,7 @@ def view(path, screenshot=None, gif=None, stride=3, streamlines=False):
     def cut(value):state['cutaway']=bool(value);refresh()
     def vectors(value):state['glyphs']=bool(value);refresh()
     def streams(value):state['streamlines']=bool(value);refresh()
-    checkbox('Cutaway',cut,820,True);checkbox('Field directions',vectors,790,True);checkbox('Streamlines (display reconstruction)',streams,760,streamlines)
+    checkbox('Cutaway',cut,820,True);checkbox('Cutaway-plane field arrows',vectors,790,True);checkbox('Streamlines (display reconstruction)',streams,760,streamlines)
     for i,(rid,region) in enumerate(regions.items()):
         def visible(value,r=rid):actors[r].SetVisibility(bool(value));plot.render()
         checkbox(region['name'],visible,710-(i%17)*28,region['material']!='air',x=12+(i//17)*230)
@@ -76,7 +78,7 @@ def view(path, screenshot=None, gif=None, stride=3, streamlines=False):
             state['index']=(state['index']+1)%len(times);slider.GetRepresentation().SetValue(times[state['index']]*1e6);refresh()
     plot.add_key_event('space',lambda:state.update(playing=not state['playing']))
     plot.add_text('Linear quasistatic field — NO EDDY CURRENTS',position=(12,920),font_size=13,color='black')
-    plot.add_text('Drag plane to inspect core and air leakage.\nHide regions to reveal interior fields.\nStreamlines interpolate cell vectors for display.',position=(12,150),font_size=9,color='black')
+    plot.add_text('Field arrows follow the cutaway plane.\nDrag the plane to inspect core and air leakage.\nStreamlines interpolate cell vectors for display.',position=(12,150),font_size=9,color='black')
     plot.add_axes();plot.view_isometric();plot.reset_camera(bounds=roi)
     refresh()
     if gif:
