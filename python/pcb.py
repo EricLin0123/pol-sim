@@ -14,8 +14,9 @@ def draw_reference(g, C, rect, poly, via, chip, text, line):
     # Ground plane fields above / below the VIN bus, and side grounds.
     rect(g,-346, -352, 236,206,C['pgnd'])
     rect(g,107, -352, 209,206,C['pgnd'])
-    rect(g,-346,39,238,64,C['pgnd'])
-    rect(g,110,39,206,64,C['pgnd'])
+    # One first-layer PGND pour: center thermal island and L6/L7/R6/R7.
+    poly(g,[(-346,39),(-108,39),(-94,22),(94,22),(110,39),
+            (316,39),(316,103),(-346,103)],C['pgnd'])
     # VOUT large polygon at north, with thin neck to pads.
     poly(g,[(-99,-352),(101,-352),(101,-112),(-99,-112)],C['vout'])
     # PGND heat-spreader region with slot cutout around module.
@@ -39,7 +40,7 @@ def draw_reference(g, C, rect, poly, via, chip, text, line):
     rect(g,105,-155,48,49,'#a5a5a5','#333333',1.1,rx=10)
     rect(g,-94,-101,188,62,'#858585','#303030',1,rx=6)
     rect(g,-94,-27,188,40,'#548dd2','#2a476c',1,rx=5)
-    rect(g,-94,22,188,76,'#8b8b8b','#3d3d3d',1,rx=8)
+    rect(g,-94,22,188,76,C['pgnd'],'#3d3d3d',1,rx=8)
     rect(g,-94,-157,188,35,'#702e9b','#48205e',1,rx=5)
     for x in (-66,-13,40):
         rect(g,x-8,-158,18,8,'#702e9b','#3b2154',.7)
@@ -101,7 +102,7 @@ def render(config, output, show=True):
     fullw = (n-1)*pitch + 762*scale
     height = 703*scale
     C = p['colors']
-    fig, ax = plt.subplots(figsize=(16, 6), layout='constrained')
+    fig, ax = plt.subplots(figsize=(16, 6))
     def xy(g, x, y):
         return (g[0] + x*scale, g[1] + y*scale)
     def rect(g, x,y,w,h,fill,stroke='none',sw=1,rx=0):
@@ -142,7 +143,7 @@ def render(config, output, show=True):
         draw_reference(center, C, rect, poly, via, chip, text, line)
     ax.set(xlim=(-margin,fullw+margin), ylim=(height+margin,-margin),
            xlabel='x (mm)', ylabel='y (mm)',
-           title=f'{n} parallel DC/DC modules — illustrative PCB reference')
+           title=f'{n} DC/DC module — illustrative PCB reference')
     ax.set_aspect('equal')
     output = Path(output)
     output.parent.mkdir(parents=True,exist_ok=True)
@@ -168,7 +169,7 @@ def render(config, output, show=True):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=ROOT/'config.yaml')
-    parser.add_argument('--output',type=Path,default=ROOT/'output/pcb/pcb_three_modules',help='Output prefix')
+    parser.add_argument('--output',type=Path,default=ROOT/'output/pcb/pcb_single_module',help='Output prefix')
     parser.add_argument('--no-view',action='store_true',help='Export without opening a window')
     args=parser.parse_args()
     if args.no_view:

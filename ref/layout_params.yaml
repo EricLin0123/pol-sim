@@ -1,6 +1,6 @@
 # Dimensions reconstructed from a raster layout; estimates, NOT fabrication data.
 source_device_config: config.yaml
-modules: 3
+modules: 1
 module_pitch_mm: 9.54  # ~661 px / (312 px / 4.5 mm)
 module_footprint_mm: 4.5  # read from source config at runtime
 board_margin_mm: 0.25

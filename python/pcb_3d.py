@@ -49,11 +49,14 @@ def build_assembly(config, footprint):
                 pts.extend((cx+radius*math.cos(t),cy+radius*math.sin(t)) for t in np.linspace(math.radians(start),math.radians(start+90),9))
         else: pts=[(x,y),(x+w,y),(x+w,y+h),(x,y+h)]
         poly(g,pts,fill)
+    ground_via_sites = {(0,-60),(-53,49),(0,49),(53,49),(-26,77),(26,77)}
+    ground_via_sites.update((x,y) for x in (-166,164) for y in (-282,-246,-211))
+    ground_via_sites.update((x,y) for x in (-262,264) for y in (56,91))
     def via(g,x,y,*args):
         drill=float(p['via_drill_diameter_mm']); outer=float(p['via_outer_diameter_mm'])
         if not all(math.isfinite(v) for v in (drill,outer)) or not 0 < drill < outer or drill+2*thickness > outer:
             raise ValueError('Via drill plus twice the copper wall must fit inside its outer diameter')
-        vias.append(dict(name=f'via_{len(vias)+1}',center_xy_mm=points(g,[(x,y)])[0],
+        vias.append(dict(name=f'via_{len(vias)+1}',net_hint='PGND' if (x,y) in ground_via_sites else 'UNASSIGNED',center_xy_mm=points(g,[(x,y)])[0],
                          drill_radius_mm=drill/2,barrel_outer_radius_mm=drill/2+thickness,
                          pad_outer_radius_mm=outer/2,z_min_mm=z-(dielectric or 0),z_max_mm=z+thickness))
     noop=lambda *a,**kw: None
@@ -65,11 +68,14 @@ def build_assembly(config, footprint):
     if not math.isfinite(angle): raise ValueError('Module rotation must be finite')
     placements=[dict(name=f'module_{i+1}',translation_mm=[cx,-cy,z+thickness-config['geometry']['ic_z_mm']],rotation_z_deg=angle) for i,(cx,cy) in enumerate(centers)]
     bounds=[-margin,-703*scale-margin,(n-1)*pitch+762*scale+margin,margin]
+    pgnd_connections = [dict(module=place['name'], pad=pad, layer='top')
+                        for place in placements
+                        for pad in ('PGND_BOTTOM','L6','L7','R6','R7')]
     return dict(schema='pol_sim_pcb_assembly_v1',units='mm',coordinate_system='right-handed; x right, y north, z up',
-                copper_thickness_mm=thickness,pcb_copper=copper,vias=vias,module_definition=module,module_placements=placements,
+                pgnd_connections=pgnd_connections,copper_thickness_mm=thickness,pcb_copper=copper,vias=vias,module_definition=module,module_placements=placements,
                 substrate=None if dielectric is None else dict(name='pcb_dielectric',material=opts['dielectric_material'],
                     min_mm=[bounds[0],bounds[1],z-dielectric],max_mm=[bounds[2],bounds[3],z]),
-                em_ready=False,assumptions=['All traced PCB copper assigned to a single top layer',
+                em_ready=False,assumptions=['Single top copper layer; continuous lower PGND pour joins center island and four side pins',
                     '1.0 mm FR4 thickness is user-approved preliminary assumption' if dielectric == 1 else 'Configured dielectric thickness',
                     'Illustration bounds assumed to be rectangular substrate outline',
                     'Via barrel copper wall equals PCB copper thickness; no bottom copper layer inferred',
@@ -96,15 +102,12 @@ def box_faces(lo,hi):
 
 
 def view(model, output, show):
-    import matplotlib
-    if not show: matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.widgets import CheckButtons
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-    fig=plt.figure(figsize=(16,8)); ax=fig.add_subplot(111,projection='3d'); groups={}
+    import pyvista as pv
+    from view_3d import add as add_mesh, controls, surface
+    plotter = pv.Plotter(off_screen=not show, window_size=(1600, 800))
+    groups = {}
     def add(faces,color,label,alpha=1):
-        artist=Poly3DCollection(faces,facecolor=color,edgecolor='none',alpha=alpha)
-        ax.add_collection3d(artist);groups.setdefault(label,[]).append(artist)
+        return add_mesh(plotter, groups, surface(faces), color, label, alpha)
     for p in model['pcb_copper']:
         xy=p['polygon_xy_mm']; lower=np.array([[x,y,p['z_min_mm']] for x,y in xy]); upper=lower.copy();upper[:,2]=p['z_max_mm']
         add([lower[::-1],upper]+[np.array([lower[i],lower[(i+1)%len(xy)],upper[(i+1)%len(xy)],upper[i]]) for i in range(len(xy))],p['color'],'PCB copper')
@@ -125,18 +128,13 @@ def view(model, output, show):
             add([transform(f,place) for f in box_faces(body['min_mm'],body['max_mm'])],color,label,.14 if label=='Module envelopes' else .8)
         for pin in mod.get('pin_solids',[]): add([transform(f,place) for f in prism_faces(pin)],'#b87333','Module pins')
         for wire in mod.get('capsules',[]): add([transform(f,place) for f in tube(wire['a_mm'],wire['b_mm'],wire['radius_mm'])],'#c88232','Winding')
-    centers=np.array([p['translation_mm'] for p in model['module_placements']]); x0=min(p['polygon_xy_mm'][0][0] for p in model['pcb_copper'])
-    ax.set(xlim=(x0-1,centers[-1,0]+6),ylim=(-11,1),zlim=(-1.2,5),xlabel='x (mm)',ylabel='y (mm)',zlabel='z (mm)',title='Three-module PCB assembly — copper 0.02 mm (true scale)')
-    ax.set_box_aspect((centers[-1,0]+7-x0,12,6.2));ax.view_init(elev=28,azim=-65)
-    fig.subplots_adjust(left=.17)
-    checks=CheckButtons(fig.add_axes([.01,.32,.16,.36]),list(groups),[True]*len(groups))
-    def toggle(label):
-        for artist in groups[label]: artist.set_visible(not artist.get_visible())
-        fig.canvas.draw_idle()
-    checks.on_clicked(toggle)
-    fig.savefig(output/'assembly.png',dpi=170,bbox_inches='tight')
-    if show: plt.show()
-    plt.close(fig)
+    controls(plotter, groups, f"{len(model['module_placements'])}-module PCB assembly")
+    output.mkdir(parents=True, exist_ok=True)
+    if show:
+        plotter.show(auto_close=False)
+    plotter.screenshot(str(output/'assembly.png'))
+    plotter.close()
+    return plotter
 
 
 def export_cad(model, directory):

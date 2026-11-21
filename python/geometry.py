@@ -1,4 +1,4 @@
-"""Shared module geometry and matplotlib preview; coordinates are millimeters."""
+"""Shared module geometry and PyVista preview; coordinates are millimeters."""
 import argparse
 import copy
 import json
@@ -123,159 +123,78 @@ def export_model(model, directory):
 
 
 def plot_model(model, screenshot=None, backend=None):
-    import importlib.util
-    import matplotlib
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyBboxPatch, Rectangle
-    from matplotlib.widgets import CheckButtons
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection, pathpatch_2d_to_3d
-
+    """Show module solids, die floorplan and pad plane with PyVista."""
+    import pyvista as pv
+    from view_3d import add, box, capsule, controls, surface, pad_surface
+    if backend and backend.lower() not in ('pyvista', 'vtk', 'agg', 'off_screen'):
+        raise ValueError('Use --backend pyvista or off_screen')
+    off_screen = bool(screenshot) or backend in ('agg', 'off_screen')
+    if off_screen and screenshot is None:
+        screenshot = ROOT/'output'/'module.png'
     has_die = bool(model.get('die'))
-    figure_size = (19,7) if has_die else (14,7)
-    try:
-        if screenshot:
-            plt.switch_backend('Agg')
-        elif backend:
-            plt.switch_backend(backend)
-        elif matplotlib.get_backend().lower() == 'agg':
-            if importlib.util.find_spec('PySide6'):
-                plt.switch_backend('QtAgg')
-            else:
-                import _tkinter
-                if not getattr(_tkinter, '__file__', None):
-                    raise RuntimeError('No compatible GUI backend. Install project dependencies: uv sync')
-                plt.switch_backend('TkAgg')
-        fig = plt.figure(figsize=figure_size)
-    except Exception as error:
-        # Only backend/window initialization is guarded, not model rendering.
-        if backend:
-            raise RuntimeError(f'Cannot open matplotlib backend {backend}: {error}') from error
-        plt.switch_backend('Agg')
-        screenshot = screenshot or ROOT/'output'/'module.png'
-        print(f'Interactive display unavailable: {error}')
-        fig = plt.figure(figsize=figure_size)
-    if fig.canvas.manager is None or fig.canvas.required_interactive_framework is None:
-        if matplotlib.get_backend().lower() == 'agg':
-            screenshot = screenshot or ROOT/'output'/'module.png'
-    ax = fig.add_subplot(131 if has_die else 121, projection='3d')
+    plotter = pv.Plotter(shape=(1, 3 if has_die else 2), off_screen=off_screen,
+                         window_size=(1900 if has_die else 1400, 800))
     groups = {}
-    def register(label, artist):
-        groups.setdefault(label, []).append(artist)
-        return artist
     detailed = bool(model.get('capsules'))
-    for b in model['bodies']:
-        is_terminal = b['name'].startswith('terminal_')
-        color = ('slategray' if b.get('material') == 'silicon' else '#b87333' if is_terminal and b.get('material') == 'copper' else 'silver' if is_terminal else
-                 'royalblue' if b['name'] == 'ic_package' else 'dimgray' if detailed else 'orange')
-        x0,y0,z0 = b['min_mm']
-        x1,y1,z1 = b['max_mm']
-        vertices = [(x0,y0,z0),(x1,y0,z0),(x1,y1,z0),(x0,y1,z0),
-                    (x0,y0,z1),(x1,y0,z1),(x1,y1,z1),(x0,y1,z1)]
-        faces = [[vertices[i] for i in face] for face in
-                 ((0,1,2,3),(4,5,6,7),(0,1,5,4),(1,2,6,5),(2,3,7,6),(3,0,4,7))]
-        alpha = 0.10 if b['name'] == 'inductor' and detailed else 0.65 if b.get('role') == 'solid' else 0.20
-        label = ('Silicon die' if b.get('material') == 'silicon' else 'Copper terminals' if is_terminal and b.get('material') == 'copper' else 'Metal terminals' if is_terminal
-                 else 'IC package EMC' if b['name'] == 'ic_package' and b.get('material') == 'ic_epoxy_molding_compound' else 'IC package envelope' if b['name'] == 'ic_package' else 'Metal composite' if detailed else 'Inductor envelope')
-        register(label, ax.add_collection3d(Poly3DCollection(faces, facecolor=color, edgecolor='black', alpha=alpha)))
-    if detailed:
-        import numpy as np
-        wire_faces = {'Copper winding': [], 'Copper leads': []}
-        # Draw actual-radius tubes, rather than screen-space thick lines.
-        for c in model['capsules']:
-            faces = wire_faces['Copper leads' if c['name'].startswith('lead_') else 'Copper winding']
-            a, b = np.array(c['a_mm']), np.array(c['b_mm'])
-            direction = b-a
-            direction /= np.linalg.norm(direction)
-            ref = np.array([0.,0.,1.]) if abs(direction[2]) < 0.9 else np.array([1.,0.,0.])
-            u = np.cross(direction,ref); u /= np.linalg.norm(u)
-            v = np.cross(direction,u)
-            ring = np.array([c['radius_mm']*(u*np.cos(t)+v*np.sin(t)) for t in np.linspace(0,2*np.pi,12,endpoint=False)])
-            for i in range(12):
-                j = (i+1)%12
-                faces.append([a+ring[i],a+ring[j],b+ring[j],b+ring[i]])
-        for label, faces in wire_faces.items():
-            if faces:
-                register(label,ax.add_collection3d(Poly3DCollection(faces,facecolor='#b87333',edgecolor='none')))
+    for body in model['bodies']:
+        terminal = body['name'].startswith('terminal_')
+        label = ('Silicon die' if body.get('material') == 'silicon' else
+                 'Terminals' if terminal else 'IC package' if body['name'] == 'ic_package' else 'Inductor')
+        color = 'slategray' if label == 'Silicon die' else '#b87333' if terminal else 'royalblue' if label == 'IC package' else 'dimgray'
+        opacity = .1 if body['name'] == 'inductor' and detailed else .65 if body.get('role') == 'solid' else .2
+        add(plotter, groups, box(body['min_mm'], body['max_mm']), color, label, opacity)
+    for wire in model.get('capsules', []):
+        add(plotter, groups, capsule(wire['a_mm'], wire['b_mm'], wire['radius_mm']), '#b87333',
+            'Copper leads' if wire['name'].startswith('lead_') else 'Copper winding')
+    for pin in model.get('pin_solids', []):
+        add(plotter, groups, surface(prism_faces(pin)), '#b87333', 'Pads / pins')
+    die = next((b for b in model['bodies'] if b['name'] == 'silicon_die'), None)
+    for source, color in zip(model.get('heat_sources', []), ('tomato', 'limegreen', 'purple')):
+        if source.get('footprint_xy_mm') is None:
+            continue
+        a, b, c, d = source['footprint_xy_mm']
+        mesh = (box(source['min_mm'], source['max_mm']) if source.get('min_mm') is not None else
+                surface([[(a,b,die['max_mm'][2]), (c,b,die['max_mm'][2]), (c,d,die['max_mm'][2]), (a,d,die['max_mm'][2])]]))
+        add(plotter, groups, mesh, color, source['name'], .8)
+        if has_die:
+            plotter.subplot(0, 1)
+            add(plotter, groups, surface([[(a,b,0), (c,b,0), (c,d,0), (a,d,0)]]), color, source['name'])
+            power = source.get('heat_source_power_w')
+            plotter.add_point_labels([[(a+c)/2,(b+d)/2,0]], [f"{source['name']}\nP: {power if power is not None else 'unset'} W"], font_size=10, always_visible=True)
+            plotter.subplot(0, 0)
+    plotter.subplot(0, 2 if has_die else 1)
+    for pad in model['footprint']['pads']:
+        x, y, w, h = pad['rect_mm']
+        mesh = pad_surface(pad)
+        color = 'gray' if pad['net'] == 'UNASSIGNED' else 'goldenrod'
+        add(plotter, groups, mesh, color, 'Pads / pins')
+        plotter.add_point_labels([[x+w/2,y+h/2,0]], [f"{pad['name']}\n{pad['net']}"], font_size=8, always_visible=True)
+        if not model.get('pin_solids'):
+            plotter.subplot(0, 0)
+            add(plotter, groups, mesh.translate((0,0,model['pad_z_mm']), inplace=False), color, 'Pads / pins')
+            plotter.subplot(0, 2 if has_die else 1)
+    plotter.set_background('white')
+    plotter.add_text('Pad plane (original x/y)', font_size=11, color='black')
+    plotter.view_xy()
+    plotter.enable_parallel_projection()
     if has_die:
-        die = next(b for b in model['bodies'] if b['name'] == 'silicon_die')
-        plan = fig.add_subplot(132)
-        x0,y0,_ = die['min_mm']; x1,y1,z1 = die['max_mm']
-        register('Silicon die',plan.add_patch(Rectangle((x0,y0),x1-x0,y1-y0,facecolor='lightgray',edgecolor='black')))
-        for s, color in zip(model['heat_sources'],('tomato','limegreen','purple')):
-            if s['footprint_xy_mm'] is None:
-                continue
-            a,b,c,d = s['footprint_xy_mm']
-            label = {'high_side_fet': 'High-side FET', 'low_side_fet': 'Low-side FET'}.get(s['name'],s['name'].replace('_',' ').capitalize())
-            register(label,plan.add_patch(Rectangle((a,b),c-a,d-b,facecolor=color,edgecolor='black',alpha=0.7)))
-            power = 'unset' if s['heat_source_power_w'] is None else f"{s['heat_source_power_w']} W"
-            register(label,plan.text((a+c)/2,(b+d)/2,s['name'].replace('_','\n')+'\nP: '+power,ha='center',va='center',fontsize=8))
-            if s['min_mm'] is not None:
-                z0,z_top = s['min_mm'][2],s['max_mm'][2]
-                vertices = [(a,b,z0),(c,b,z0),(c,d,z0),(a,d,z0),
-                            (a,b,z_top),(c,b,z_top),(c,d,z_top),(a,d,z_top)]
-                faces = [[vertices[i] for i in f] for f in
-                         ((0,3,2,1),(4,5,6,7),(0,1,5,4),(1,2,6,5),(2,3,7,6),(3,0,4,7))]
-            else:
-                faces = [[(a,b,z1),(c,b,z1),(c,d,z1),(a,d,z1)]]
-            register(label,ax.add_collection3d(Poly3DCollection(faces,facecolor=color,edgecolor='black',alpha=0.8)))
-        unplaced = [s['name'] for s in model['heat_sources'] if s['footprint_xy_mm'] is None]
-        plan.set(xlim=(x0-.15,x1+.15),ylim=(y0-.15,y1+.15),aspect='equal',xlabel='x (mm)',ylabel='y (mm)',
-                 title='Hypothetical die floorplan\nFET volumes in 3D' if model['die'].get('heat_source_surface') else 'Hypothetical die floorplan\nFET projections in 3D')
-        plan.text(0.02,0.02,'Unplaced: '+', '.join(unplaced)+'\nSource depth retained; active surface '+str(model['die'].get('heat_source_surface') or 'unset'),
-                  transform=plan.transAxes,fontsize=8,va='bottom',bbox=dict(facecolor='white',alpha=0.8,edgecolor='none'))
-    bottom = fig.add_subplot(133 if has_die else 122)
-    pin_solids = model.get('pin_solids', [])
-    if pin_solids:
-        for pin in pin_solids:
-            register('Pads / pins',ax.add_collection3d(Poly3DCollection(prism_faces(pin),facecolor='#b87333',edgecolor='black',linewidth=0.3)))
-    for p in model['footprint']['pads']:
-        x,y,w,h = p['rect_mm']
-        radius = min(p['corner_radius_mm'],w/2,h/2)
-        style = f'round,pad=0,rounding_size={radius}'
-        color = 'gray' if p['net']=='UNASSIGNED' else 'goldenrod'
-        for axis in ((bottom,) if pin_solids else (bottom,ax)):
-            patch = FancyBboxPatch((x,y),w,h,boxstyle=style,facecolor=color,edgecolor='black')
-            axis.add_patch(patch)
-            register('Pads / pins',patch)
-            if axis is ax:
-                pathpatch_2d_to_3d(patch,z=model['pad_z_mm'],zdir='z')
-        register('Pads / pins',bottom.text(x+w/2,y+h/2,f"{p['name']}\n{p['net']}",ha='center',va='center',fontsize=5))
-    lo = [min(b['min_mm'][i] for b in model['bodies']) for i in range(3)]
-    hi = [max(b['max_mm'][i] for b in model['bodies']) for i in range(3)]
-    for p in pin_solids:
-        lo = [min(a,b) for a,b in zip(lo,p['min_mm'])]
-        hi = [max(a,b) for a,b in zip(hi,p['max_mm'])]
-    ax.set(xlim=(lo[0],hi[0]),ylim=(lo[1],hi[1]),zlim=(lo[2],hi[2]),
-           xlabel='x (mm)',ylabel='y (mm)',zlabel='z (mm)',title='Assumed module envelopes')
-    ax.set_box_aspect([b-a for a,b in zip(lo,hi)])
-    bottom.set(xlim=(lo[0],hi[0]),ylim=(lo[1],hi[1]),aspect='equal',
-               xlabel='x (mm)',ylabel='y (mm)',title='Pad plane (original x/y; no mirroring)')
-    label = 'ILLUSTRATIVE winding — not reference-validated' if model.get('inductor_detail',{}).get('illustrative') else 'Unverified parametric geometry'
-    fig.suptitle(label + ' — pin assignments retained as supplied')
-    fig.subplots_adjust(left=0.20, right=0.97, bottom=0.12, top=0.85, wspace=0.25)
-    controls = fig.add_axes([0.01,0.27,0.16,0.52])
-    controls.set_title('Render parts / materials',fontsize=10,loc='left')
-    labels = list(groups)
-    checks = CheckButtons(controls,labels,[True]*len(labels))
-    for label in checks.labels:
-        label.set_fontsize(9)
-    def toggle(label):
-        visible = checks.get_status()[labels.index(label)]
-        for artist in groups[label]:
-            artist.set_visible(visible)
-        fig.canvas.draw_idle()
-    checks.on_clicked(toggle)
-    # Keep widgets alive for callbacks and expose the groups for verification.
-    fig._visibility_controls = (checks, groups)
-    fig.text(0.012,0.19,'All parts shown initially.\nUncheck outer envelopes\nto inspect the interior.',fontsize=9)
+        plotter.subplot(0, 1)
+        if die:
+            lo, hi = die['min_mm'], die['max_mm']
+            plotter.add_mesh(surface([[(lo[0],lo[1],-.001),(hi[0],lo[1],-.001),(hi[0],hi[1],-.001),(lo[0],hi[1],-.001)]]), color='lightgray')
+        plotter.set_background('white')
+        plotter.add_text('Hypothetical die floorplan', font_size=11, color='black')
+        plotter.view_xy()
+        plotter.enable_parallel_projection()
+    plotter.subplot(0, 0)
+    title = 'ILLUSTRATIVE winding' if model.get('inductor_detail', {}).get('illustrative') else 'Unverified parametric geometry'
+    controls(plotter, groups, title)
     if screenshot:
-        screenshot.parent.mkdir(parents=True,exist_ok=True)
-        fig.savefig(screenshot,dpi=180)
-        plt.close(fig)
-        print(f'Saved module preview: {screenshot.resolve()}')
-    else:
-        plt.show()
-    return fig
+        screenshot = Path(screenshot)
+        screenshot.parent.mkdir(parents=True, exist_ok=True)
+    plotter.show(screenshot=str(screenshot) if screenshot else None)
+    return plotter
+
 
 
 def main():
@@ -286,7 +205,7 @@ def main():
     parser.add_argument('--demo-winding',action='store_true',help='Use explicitly illustrative internals; export to output/inductor-demo by default')
     parser.add_argument('--model',type=Path,help='View saved module.json without regenerating')
     parser.add_argument('--screenshot',type=Path)
-    parser.add_argument('--backend',help='Matplotlib backend, e.g. TkAgg or QtAgg')
+    parser.add_argument('--backend',help='Viewer backend: pyvista or off_screen')
     parser.add_argument('--no-view',action='store_true',help='Export only')
     args = parser.parse_args()
     if args.model and args.demo_winding:

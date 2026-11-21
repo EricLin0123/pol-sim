@@ -24,7 +24,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--params', default='layout_params.yaml')
     ap.add_argument('--device', default='config.yaml')
-    ap.add_argument('--output', default='pcb_three_modules')
+    ap.add_argument('--output', default='pcb_single_module')
     args = ap.parse_args()
     p = yaml.safe_load(Path(args.params).read_text())
     d = yaml.safe_load(Path(args.device).read_text())
@@ -71,8 +71,8 @@ def main():
         # Ground plane fields above / below the VIN bus, and side grounds.
         rect(g,-346, -352, 236,206,C['pgnd'])
         rect(g,107, -352, 209,206,C['pgnd'])
-        rect(g,-346,39,238,64,C['pgnd'])
-        rect(g,110,39,206,64,C['pgnd'])
+        poly(g,[(-346,39),(-108,39),(-94,22),(94,22),(110,39),
+                (316,39),(316,103),(-346,103)],C['pgnd'])
         # VOUT large polygon at north, with thin neck to pads.
         poly(g,[(-99,-352),(101,-352),(101,-112),(-99,-112)],C['vout'])
         # PGND heat-spreader region with slot cutout around module.
@@ -96,7 +96,7 @@ def main():
         rect(g,105,-155,48,49,'#a5a5a5','#333333',1.1,rx=10)
         rect(g,-94,-101,188,62,'#858585','#303030',1,rx=6)
         rect(g,-94,-27,188,40,'#548dd2','#2a476c',1,rx=5)
-        rect(g,-94,22,188,76,'#8b8b8b','#3d3d3d',1,rx=8)
+        rect(g,-94,22,188,76,C['pgnd'],'#3d3d3d',1,rx=8)
         rect(g,-94,-157,188,35,'#702e9b','#48205e',1,rx=5)
         for x in (-66,-13,40):
             rect(g,x-8,-158,18,8,'#702e9b','#3b2154',.7)
