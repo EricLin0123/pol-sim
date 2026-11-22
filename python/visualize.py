@@ -8,7 +8,7 @@ import yaml
 from geometry import DATA, ROOT, build_model, export_model, plot_model
 
 
-def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
+def mesh_view(data, scalar=None, report=None, off_screen=False, series=None, clim=None):
     """Show actual element faces with a movable, whole-cell cutaway."""
     import numpy as np
     import pyvista as pv
@@ -24,6 +24,10 @@ def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
         data.point_data['_thermal_node_index']=np.arange(data.n_points)
         data.point_data['temperature_K']=temperatures[0]
         data.point_data['temperature_C']=temperatures[0]-273.15
+    if clim is not None:
+        clim = tuple(float(value) for value in clim)
+        if len(clim) != 2 or not np.all(np.isfinite(clim)) or clim[0] >= clim[1]:
+            raise ValueError('Color limits must be two finite, increasing values')
     plotter = pv.Plotter(off_screen=off_screen,window_size=(1400,900))
     plotter.set_background('white')
     scalar = scalar or ('temperature_C' if 'temperature_C' in data.point_data else
@@ -38,13 +42,16 @@ def mesh_view(data, scalar=None, report=None, off_screen=False, series=None):
     ids = np.unique(data.cell_data['region_id']) if 'region_id' in data.cell_data else [None]
     actors, originals = {}, {}
     state = dict(cutaway=True,slice=False,edges=True,normal=(0,1,0),origin=data.center)
-    clim = data.get_data_range(scalar) if scalar else None
-    if scalar=='temperature_difference_C':
-        extent=max(abs(clim[0]),abs(clim[1]),1e-12)
-        clim=(-extent,extent)
-    if series is not None and scalar in ('temperature_C','temperature_K','mean_temperature_C'):
-        offset=0 if scalar=='temperature_K' else 273.15
-        clim=(float(temperatures.min()-offset),float(temperatures.max()-offset))
+    if clim is None:
+        if scalar in ('temperature_C','mean_temperature_C'):
+            clim = (0.0, 220.0)
+        elif scalar == 'temperature_K':
+            clim = (273.15, 493.15)
+        else:
+            clim = data.get_data_range(scalar) if scalar else None
+            if scalar == 'temperature_difference_C':
+                extent = max(abs(clim[0]), abs(clim[1]), 1e-12)
+                clim = (-extent, extent)
     for i,region_id in enumerate(ids):
         key = str(int(region_id)) if region_id is not None else 'mesh'
         grid = data.threshold([region_id,region_id],scalars='region_id') if region_id is not None else data
@@ -173,10 +180,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, nargs="?", help="VTK dataset, e.g. output/result.vtu")
     parser.add_argument("--scalar", help="Optional field name to color")
+    parser.add_argument("--clim", type=float, nargs=2, metavar=("MIN", "MAX"),
+                        help="Fixed color limits in selected field units; temperature defaults to 0-220 C")
     parser.add_argument("--model", type=Path, help="Open a saved model instead of rebuilding the full assembly")
     parser.add_argument("--backend", help="Viewer backend: pyvista or off_screen")
     parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args()
+    if args.clim is not None:
+        import math
+        if not all(math.isfinite(value) for value in args.clim) or args.clim[0] >= args.clim[1]:
+            parser.error('--clim requires two finite, increasing values')
+        if args.input is None or args.input.name == 'magnetic.vtu':
+            parser.error('--clim requires a scalar dataset supported by the mesh viewer')
     if args.input is None:
         if args.model and args.model.is_file():
             model = json.loads(args.model.read_text())
@@ -215,7 +230,7 @@ def main():
     report_path = args.input.with_name('report.json')
     if not report_path.is_file():report_path=args.input.with_name('comparison.json')
     report = json.loads(report_path.read_text()) if report_path.is_file() else None
-    plotter = mesh_view(data,args.scalar,report,off_screen=bool(args.screenshot),series=series)
+    plotter = mesh_view(data,args.scalar,report,off_screen=bool(args.screenshot),series=series,clim=args.clim)
     if args.screenshot:
         args.screenshot.parent.mkdir(parents=True,exist_ok=True)
     plotter.show(screenshot=str(args.screenshot) if args.screenshot else None)
